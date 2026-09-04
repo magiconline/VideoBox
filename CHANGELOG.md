@@ -4,7 +4,25 @@ All notable changes to VideoBox are documented here. / VideoBox 的重要变更�
 
 ## Unreleased / 未发布
 
-- Adopted the MIT License. / 项目采用 MIT License。
+## [2.0.0] - 2026-09-04
+
+### English
+
+- Bundled universal `ffmpeg` and `ffprobe` executables, so users no longer need Homebrew or a separate FFmpeg installation.
+- Retained software H.264 (`libx264`) and H.265/HEVC (`libx265`) encoding, alongside SVT-AV1, Opus, ProRes, and VideoToolbox hardware encoding.
+- Added subtitle burn-in support through libass, with the required text-shaping and font libraries included statically.
+- Added repeatable, checksum-pinned FFmpeg runtime builds and corresponding-source archives for every release.
+- Added in-app third-party license notices and runtime build metadata.
+- Adopted the MIT License for the VideoBox application source.
+
+### 中文
+
+- 内置通用架构的 `ffmpeg` 与 `ffprobe`，用户无需再安装 Homebrew 或单独配置 FFmpeg。
+- 保留 H.264（`libx264`）与 H.265/HEVC（`libx265`）软件编码，并继续提供 SVT-AV1、Opus、ProRes 和 VideoToolbox 硬件编码。
+- 通过 libass 提供字幕烧录，并静态包含所需的文字整形与字体依赖。
+- 新增固定版本与校验值、可重复执行的 FFmpeg 构建流程，并为每个版本发布对应源码归档。
+- 在 App 内附带第三方许可证与运行时构建信息。
+- VideoBox 应用源码采用 MIT License。
 
 ## [0.1.0] - 2026-09-04
 

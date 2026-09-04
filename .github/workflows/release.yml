@@ -11,7 +11,7 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
       - name: Check out source
@@ -27,18 +27,35 @@ jobs:
             exit 1
           fi
 
+      - name: Install media runtime build tools
+        run: brew install cmake nasm pkgconf
+
+      - name: Cache verified upstream source archives
+        uses: actions/cache@v4
+        with:
+          path: .build/ffmpeg-runtime/downloads
+          key: videobox-ffmpeg-sources-${{ hashFiles('Scripts/ffmpeg_versions.sh') }}
+
       - name: Test
         run: swift test
 
       - name: Build and verify universal DMG
         run: ./Scripts/create_dmg.sh release
 
+      - name: Package corresponding FFmpeg source
+        run: ./Scripts/create_ffmpeg_source_archive.sh
+
       - name: Create GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          artifacts=(dist/*.dmg dist/*.dmg.sha256)
+          artifacts=(
+            dist/*.dmg
+            dist/*.dmg.sha256
+            dist/*-ffmpeg-corresponding-source.tar.xz
+            dist/*-ffmpeg-corresponding-source.tar.xz.sha256
+          )
           notes_path="Documentation/Releases/${GITHUB_REF_NAME}.md"
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
@@ -58,8 +75,8 @@ jobs:
             release_arguments+=(--generate-notes)
           fi
 
-          if [[ "$GITHUB_REF_NAME" == v0.* ]]; then
-            release_arguments+=(--prerelease)
-          fi
+          # Keep releases marked as preview until Developer ID signing and
+          # Apple notarization are configured for this workflow.
+          release_arguments+=(--prerelease)
 
           gh release create "${release_arguments[@]}"

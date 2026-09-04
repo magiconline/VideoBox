@@ -7,7 +7,8 @@ configuration=${1:-release}
 signing_identity=${VIDEOBOX_SIGNING_IDENTITY:--}
 notary_profile=${VIDEOBOX_NOTARY_PROFILE:-}
 
-app_path=$("$script_dir/package_app.sh" "$configuration" | tail -n 1)
+"$script_dir/package_app.sh" "$configuration"
+app_path="$project_root/dist/VideoBox.app"
 version=$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")
 binary_architectures=$(lipo -archs "$app_path/Contents/MacOS/VideoBox")
 
@@ -18,6 +19,7 @@ else
 fi
 
 distribution_dir="$project_root/dist"
+third_party_notices="$project_root/ThirdParty/FFmpeg/THIRD_PARTY_NOTICES.md"
 dmg_name="VideoBox-${version}-macOS-${architecture_label}.dmg"
 destination_dmg="$distribution_dir/$dmg_name"
 checksum_path="$destination_dmg.sha256"
@@ -37,6 +39,7 @@ trap cleanup_staging EXIT
 
 mkdir -p "$volume_source" "$mount_point" "$distribution_dir"
 ditto "$app_path" "$volume_source/VideoBox.app"
+ditto "$third_party_notices" "$volume_source/Third-Party Notices.md"
 ln -s /Applications "$volume_source/Applications"
 
 hdiutil create \
@@ -77,6 +80,7 @@ is_mounted=1
 
 [[ -d "$mount_point/VideoBox.app" ]]
 [[ -L "$mount_point/Applications" ]]
+[[ -f "$mount_point/Third-Party Notices.md" ]]
 codesign --verify --deep --strict --verbose=2 "$mount_point/VideoBox.app"
 
 hdiutil detach "$mount_point" -quiet

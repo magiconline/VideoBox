@@ -7,10 +7,10 @@
 
 ![VideoBox editor](Documentation/Images/editor.png)
 
-VideoBox combines a SwiftUI interface and AVFoundation playback with the power of FFmpeg. It keeps media processing local, exposes the generated FFmpeg command, and puts quick stream-copy exports and configurable transcoding in one workspace.
+VideoBox combines a SwiftUI interface and AVFoundation playback with a self-contained FFmpeg runtime. It keeps media processing local, exposes the generated FFmpeg command, and puts quick stream-copy exports and configurable transcoding in one workspace.
 
 > [!IMPORTANT]
-> VideoBox is an early preview. The current interface is in Simplified Chinese, FFmpeg and ffprobe must be installed separately, and the preview DMG is ad-hoc signed rather than Apple-notarized.
+> VideoBox is an early preview. The current interface is in Simplified Chinese, and the preview DMG is ad-hoc signed rather than Apple-notarized. FFmpeg and ffprobe are included in the app.
 
 ## Highlights
 
@@ -28,32 +28,23 @@ VideoBox combines a SwiftUI interface and AVFoundation playback with the power o
 
 - macOS 13 Ventura or later.
 - Apple Silicon or Intel Mac.
-- `ffmpeg` and `ffprobe` available through Homebrew or your `PATH`.
-
-Install the media tools with Homebrew:
-
-```bash
-brew install ffmpeg
-```
-
-VideoBox checks `PATH`, `/opt/homebrew/bin`, `/opt/homebrew/opt/ffmpeg-full/bin`, `/usr/local/bin`, and `/usr/bin`.
+- No Homebrew installation or separate media tools are required for the DMG release.
 
 ## Install the preview
 
 1. Download the latest universal `.dmg` from [GitHub Releases](https://github.com/magiconline/VideoBox/releases).
 2. Open it and drag **VideoBox** to **Applications**.
 3. Because the preview is not notarized, Control-click the app and choose **Open** the first time if macOS blocks a normal launch.
-4. Install FFmpeg with the command above before exporting.
 
 The release page includes a `.sha256` file so you can verify the download:
 
 ```bash
-shasum -a 256 -c VideoBox-0.1.0-macOS-universal.dmg.sha256
+shasum -a 256 -c VideoBox-2.0.0-macOS-universal.dmg.sha256
 ```
 
 ## Build from source
 
-Open `Package.swift` in Xcode, select the **VideoBox** scheme and **My Mac**, then run the app. A Swift 5.9-compatible toolchain is required.
+Open `Package.swift` in Xcode, select the **VideoBox** scheme and **My Mac**, then run the app. A Swift 5.9-compatible toolchain is required. Development builds outside an app bundle can use FFmpeg from `PATH` or common Homebrew locations.
 
 Command-line development:
 
@@ -62,7 +53,13 @@ swift build
 swift test
 ```
 
-Create a universal, ad-hoc-signed app and DMG:
+Building the distributable DMG also compiles the pinned FFmpeg runtime from source. Install the build-only prerequisites first:
+
+```bash
+brew install cmake nasm pkgconf
+```
+
+Then create a universal, ad-hoc-signed app and DMG:
 
 ```bash
 ./Scripts/create_dmg.sh release
@@ -78,6 +75,14 @@ VIDEOBOX_NOTARY_PROFILE="notary-profile" \
 
 The notary profile must already exist in Keychain through `xcrun notarytool store-credentials`.
 
+Create the corresponding-source archive published with the DMG:
+
+```bash
+./Scripts/create_ffmpeg_source_archive.sh
+```
+
+All runtime source versions and checksums are pinned in `Scripts/ffmpeg_versions.sh`. See [the runtime build guide](ThirdParty/FFmpeg/BUILDING.md) for details.
+
 ## Project layout
 
 ```text
@@ -85,6 +90,7 @@ Assets/                 App icon source assets
 Documentation/          Screenshots and versioned release notes
 Packaging/              macOS bundle metadata
 Scripts/                Repeatable app and DMG packaging
+ThirdParty/FFmpeg/      Runtime build notes and third-party notices
 Sources/VideoBox/
 ├── App/                 App entry point and dependency container
 ├── UI/                  SwiftUI screens and components
@@ -94,16 +100,16 @@ Sources/VideoBox/
 ├── Export/              Export models and presets
 ├── Engines/             FFmpeg/ffprobe process integration
 ├── Jobs/                Export jobs and queue
-└── System/              External-tool discovery
+└── System/              Bundled-runtime and external-tool discovery
 Tests/VideoBoxTests/     Unit and integration tests
 ```
 
 ## Development status
 
-VideoBox is useful today as a local preview, but it is not yet a polished consumer release. Planned release work includes English UI localization, bundling or guided installation of compatible media tools, Developer ID signing, notarization, and broader real-world media compatibility testing.
+VideoBox is useful today as a local preview, but it is not yet a polished consumer release. Planned release work includes English UI localization, Developer ID signing, notarization, and broader real-world media compatibility testing.
 
 Bug reports and focused pull requests are welcome through [GitHub Issues](https://github.com/magiconline/VideoBox/issues).
 
 ## License
 
-VideoBox is released under the [MIT License](LICENSE). FFmpeg is a separate project with its own LGPL/GPL licensing terms and is not included in the current DMG.
+VideoBox application source is released under the [MIT License](LICENSE). The separately executable FFmpeg runtime included in the DMG contains GPL components, including x264 and x265, and is distributed under GPL-2.0-or-later plus the applicable component licenses. Every bundled-runtime release includes exact corresponding source and build scripts. See [Third-party notices](ThirdParty/FFmpeg/THIRD_PARTY_NOTICES.md).

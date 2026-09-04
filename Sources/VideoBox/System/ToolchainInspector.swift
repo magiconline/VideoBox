@@ -39,13 +39,24 @@ struct ToolchainReport: Sendable {
 struct ExecutableLocator: Sendable {
     let searchDirectories: [URL]
 
-    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+    init(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundleURL: URL? = Bundle.main.bundleURL
+    ) {
+        var searchDirectories: [URL] = []
+
+        if let bundleURL, bundleURL.pathExtension == "app" {
+            searchDirectories.append(
+                bundleURL.appendingPathComponent("Contents/Helpers", isDirectory: true)
+            )
+        }
+
         let pathDirectories = environment["PATH", default: ""]
             .split(separator: ":")
             .map { URL(fileURLWithPath: String($0), isDirectory: true) }
 
         self.init(
-            searchDirectories: pathDirectories + [
+            searchDirectories: searchDirectories + pathDirectories + [
                 URL(fileURLWithPath: "/opt/homebrew/bin", isDirectory: true),
                 URL(fileURLWithPath: "/opt/homebrew/opt/ffmpeg-full/bin", isDirectory: true),
                 URL(fileURLWithPath: "/usr/local/bin", isDirectory: true),
