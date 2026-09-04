@@ -1,25 +1,24 @@
 <div align="center">
   <img src="Assets/AppIcon.png" width="128" alt="VideoBox 应用图标">
   <h1>VideoBox</h1>
-  <p>面向 macOS 的原生视频检查、剪辑、封装转换与压缩工作台。</p>
-  <p><a href="README.md">English</a> · <strong>简体中文</strong></p>
+  <p>原生 macOS 视频处理工具：无需重新压缩，即可调整视频文件的轨道与封装格式。</p>
 </div>
 
 ![VideoBox 编辑器](Documentation/Images/editor.png)
 
-VideoBox 使用 SwiftUI 构建原生界面，以 AVFoundation 提供播放预览，并通过内置的 FFmpeg 运行时完成媒体分析与导出。所有处理均在本机进行；应用同时提供快速码流复制、可配置转码和 FFmpeg 命令预览。
+VideoBox 使用 SwiftUI 构建原生界面，以 AVFoundation 提供播放预览，并通过内置的 FFmpeg 运行时完成媒体分析与导出。它的核心能力是在不重新编码视频和音频的情况下选择、保留或移除媒体轨道、修改轨道信息，并更换文件的封装格式；需要调整画质、尺寸或编码格式时，也可以使用完整的转码与压缩功能。所有处理均在本机完成。
 
 > [!IMPORTANT]
 > VideoBox 目前是早期预览版，界面暂为简体中文。FFmpeg 与 ffprobe 已包含在 App 内；预览版 DMG 仅做临时签名，尚未通过 Apple 公证。
 
 ## 主要功能
 
+- **无需重新压缩即可调整视频文件的轨道与封装**：通过码流复制选择、保留或移除视频、音频与字幕轨道，修改轨道标题、语言及默认状态，并在原始编码兼容的前提下重新封装为 MP4、MOV、MKV 或 WebM。视频和音频码流保持不变，速度快且无画质损失。
 - 拖放导入、AVPlayer 预览与媒体信息检查。
 - 带缩略图的时间线，以及分割、删除、复制、拖放重排和顺序拼接。
 - 每个片段可独立设置速度、旋转、水平/垂直镜像、音量与缩放。
 - 检查视频、音频、字幕、附件、章节和文件元数据。
-- 选择导出轨道，并编辑轨道标题、语言和默认轨道状态。
-- 快速码流复制，或转码导出 MP4、MOV、MKV 与 WebM。
+- 可配置转码与压缩，支持 MP4、MOV、MKV 与 WebM。
 - H.264、H.265/HEVC、AV1 与 ProRes，并支持 VideoToolbox 硬件编码。
 - 分辨率、帧率、像素格式、码率、目标大小、音频、字幕与容器设置。
 - 串行后台导出队列，以及可检查的 FFmpeg 命令预览。
@@ -81,7 +80,7 @@ VIDEOBOX_NOTARY_PROFILE="notary-profile" \
 ./Scripts/create_ffmpeg_source_archive.sh
 ```
 
-运行时的版本与校验值固定在 `Scripts/ffmpeg_versions.sh` 中，详情见 [运行时构建说明](ThirdParty/FFmpeg/BUILDING.md)。
+运行时的版本与校验值固定在 `Scripts/ffmpeg_versions.sh` 中，详情见[运行时构建说明](ThirdParty/FFmpeg/BUILDING.md)。
 
 ## 项目结构
 
@@ -106,7 +105,7 @@ Tests/VideoBoxTests/     单元测试与集成测试
 
 ## 当前状态
 
-VideoBox 目前适合作为本地预览工具使用，还不是完整的消费级正式版本。后续发布工作包括英文界面本地化、Developer ID 签名与公证，以及覆盖更多真实媒体文件的兼容性测试。
+VideoBox 目前适合作为本地预览工具使用，还不是完整的消费级正式版本。后续发布工作包括 Developer ID 签名与公证，以及覆盖更多真实媒体文件的兼容性测试。
 
 欢迎通过 [GitHub Issues](https://github.com/magiconline/VideoBox/issues) 提交问题，也欢迎范围明确的 Pull Request。
 

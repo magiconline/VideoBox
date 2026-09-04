@@ -6,6 +6,8 @@ All notable changes to VideoBox are documented here. / VideoBox 的重要变更�
 
 - Build DMGs from a temporary app bundle so `dist/` no longer leaves a duplicate `VideoBox.app` indexed by Spotlight.
 - DMG 打包改用临时 App Bundle，避免 `dist/` 中残留被 Spotlight 索引的重复 `VideoBox.app`。
+- Make the default project introduction Chinese-only and highlight lossless track selection and container remuxing.
+- 默认项目简介改为纯中文，并重点说明无需重新压缩的轨道调整与封装转换能力。
 
 ## [0.2.0] - 2026-09-04
 
