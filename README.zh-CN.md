@@ -59,13 +59,13 @@ swift test
 brew install cmake nasm pkgconf
 ```
 
-然后生成 Apple Silicon 原生、临时签名的 App 与 DMG：
+然后生成 Apple Silicon 原生、临时签名的 DMG：
 
 ```bash
 ./Scripts/create_dmg.sh release
 ```
 
-产物会写入 `dist/`。如需 Developer ID 签名与公证：
+DMG 与校验文件会写入 `dist/`。中间 App Bundle 在临时目录中生成并自动清理，因此不会作为第二个应用出现在 Spotlight 搜索结果中。如需 Developer ID 签名与公证：
 
 ```bash
 VIDEOBOX_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" \

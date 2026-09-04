@@ -8,6 +8,15 @@ architecture_string=${VIDEOBOX_ARCHS:-"arm64"}
 architectures=(${=architecture_string})
 signing_identity=${VIDEOBOX_SIGNING_IDENTITY:--}
 runtime_root=${VIDEOBOX_FFMPEG_RUNTIME_DIR:-}
+default_destination_app="$project_root/dist/VideoBox.app"
+destination_app=${VIDEOBOX_APP_OUTPUT_PATH:-"$default_destination_app"}
+
+if [[ "$destination_app" != /* || "${destination_app:t}" != "VideoBox.app" ]]; then
+    print -u2 "VIDEOBOX_APP_OUTPUT_PATH must be an absolute path ending in VideoBox.app"
+    exit 2
+fi
+
+destination_directory=${destination_app:h}
 
 if [[ "$configuration" != "release" && "$configuration" != "debug" ]]; then
     print -u2 "Usage: $0 [release|debug]"
@@ -56,8 +65,6 @@ source_ffmpeg="$runtime_root/bin/ffmpeg"
 source_ffprobe="$runtime_root/bin/ffprobe"
 source_runtime_licenses="$runtime_root/licenses"
 source_runtime_metadata="$runtime_root/metadata"
-distribution_dir="$project_root/dist"
-destination_app="$distribution_dir/VideoBox.app"
 staging_root=$(mktemp -d "${TMPDIR:-/tmp}/VideoBox-package.XXXXXX")
 staging_app="$staging_root/VideoBox.app"
 version=${VIDEOBOX_VERSION:-$(plutil -extract CFBundleShortVersionString raw "$source_plist")}
@@ -133,9 +140,9 @@ codesign "${codesign_arguments[@]}" "$staging_app/Contents/Helpers/ffprobe"
 codesign "${codesign_arguments[@]}" "$staging_app"
 codesign --verify --deep --strict --verbose=2 "$staging_app"
 
-mkdir -p "$distribution_dir"
+mkdir -p "$destination_directory"
 if [[ -e "$destination_app" ]]; then
-    if [[ "$destination_app" != "$project_root/dist/VideoBox.app" ]]; then
+    if [[ "$destination_app" != "$default_destination_app" ]]; then
         print -u2 "Refusing to replace unexpected path: $destination_app"
         exit 1
     fi

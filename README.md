@@ -59,13 +59,13 @@ Building the distributable DMG also compiles the pinned FFmpeg runtime from sour
 brew install cmake nasm pkgconf
 ```
 
-Then create an Apple Silicon, ad-hoc-signed app and DMG:
+Then create an Apple Silicon, ad-hoc-signed DMG:
 
 ```bash
 ./Scripts/create_dmg.sh release
 ```
 
-Artifacts are written to `dist/`. For Developer ID signing and notarization:
+The DMG and its checksum are written to `dist/`. The intermediate app bundle is built in temporary storage and removed automatically, so it does not appear as a second app in Spotlight. For Developer ID signing and notarization:
 
 ```bash
 VIDEOBOX_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" \

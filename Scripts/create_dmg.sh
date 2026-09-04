@@ -6,27 +6,12 @@ project_root=${script_dir:h}
 configuration=${1:-release}
 signing_identity=${VIDEOBOX_SIGNING_IDENTITY:--}
 notary_profile=${VIDEOBOX_NOTARY_PROFILE:-}
-
-"$script_dir/package_app.sh" "$configuration"
-app_path="$project_root/dist/VideoBox.app"
-version=$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")
-binary_architectures=$(lipo -archs "$app_path/Contents/MacOS/VideoBox")
-
-if [[ "$binary_architectures" == *arm64* && "$binary_architectures" == *x86_64* ]]; then
-    architecture_label=universal
-else
-    architecture_label=${binary_architectures// /-}
-fi
-
 distribution_dir="$project_root/dist"
+legacy_app_path="$distribution_dir/VideoBox.app"
 third_party_notices="$project_root/ThirdParty/FFmpeg/THIRD_PARTY_NOTICES.md"
-dmg_name="VideoBox-${version}-macOS-${architecture_label}.dmg"
-destination_dmg="$distribution_dir/$dmg_name"
-checksum_path="$destination_dmg.sha256"
 staging_root=$(mktemp -d "${TMPDIR:-/tmp}/VideoBox-dmg.XXXXXX")
-volume_source="$staging_root/VideoBox $version"
-temporary_dmg="$staging_root/$dmg_name"
-mount_point="$staging_root/mount"
+app_path="$staging_root/VideoBox.app"
+mount_point=""
 is_mounted=0
 
 cleanup_staging() {
@@ -36,6 +21,23 @@ cleanup_staging() {
     rm -rf "$staging_root"
 }
 trap cleanup_staging EXIT
+
+VIDEOBOX_APP_OUTPUT_PATH="$app_path" "$script_dir/package_app.sh" "$configuration"
+version=$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")
+binary_architectures=$(lipo -archs "$app_path/Contents/MacOS/VideoBox")
+
+if [[ "$binary_architectures" == *arm64* && "$binary_architectures" == *x86_64* ]]; then
+    architecture_label=universal
+else
+    architecture_label=${binary_architectures// /-}
+fi
+
+dmg_name="VideoBox-${version}-macOS-${architecture_label}.dmg"
+destination_dmg="$distribution_dir/$dmg_name"
+checksum_path="$destination_dmg.sha256"
+volume_source="$staging_root/VideoBox $version"
+temporary_dmg="$staging_root/$dmg_name"
+mount_point="$staging_root/mount"
 
 mkdir -p "$volume_source" "$mount_point" "$distribution_dir"
 ditto "$app_path" "$volume_source/VideoBox.app"
@@ -90,6 +92,10 @@ is_mounted=0
     cd "$distribution_dir"
     shasum -a 256 "$dmg_name" > "$dmg_name.sha256"
 )
+
+if [[ -e "$legacy_app_path" ]]; then
+    rm -rf "$legacy_app_path"
+fi
 
 print "Created and verified: $destination_dmg"
 print "SHA-256: $(awk '{print $1}' "$checksum_path")"
