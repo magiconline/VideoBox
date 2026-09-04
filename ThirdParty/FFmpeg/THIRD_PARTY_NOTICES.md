@@ -13,6 +13,7 @@ Exact corresponding source code, including the build scripts and configuration n
 | x265 | 4.3 | <https://github.com/Multicorewareinc/x265> | GPL-2.0-or-later (a commercial alternative is available upstream) |
 | Opus | 1.6.1 | <https://opus-codec.org/> | BSD-3-Clause |
 | SVT-AV1 | 4.2.0 | <https://gitlab.com/AOMediaCodec/SVT-AV1> | BSD-3-Clause-Clear and Alliance for Open Media Patent License 1.0 |
+| dav1d | 1.5.3 | <https://code.videolan.org/videolan/dav1d> | BSD-2-Clause and Alliance for Open Media AV1 Patent License 1.0 |
 | libass | 0.17.5 | <https://github.com/libass/libass> | ISC |
 | FreeType | 2.14.3 | <https://freetype.org/> | GPL-2.0-or-later selected here (FreeType License also offered upstream) |
 | FriBidi | 1.0.16 | <https://github.com/fribidi/fribidi> | LGPL-2.1-or-later |

@@ -73,13 +73,124 @@ actor FFmpegExportEngine: MediaExporting {
     }
 }
 
+struct TrackPreviewRequest: Sendable {
+    let primarySourceURL: URL
+    let destinationURL: URL
+    let tracks: [TrackExportSettings]
+    let duration: TimeInterval?
+    let subtitleOffset: TimeInterval
+}
+
+struct TrackPreviewAsset: Sendable {
+    let mediaURL: URL
+    let subtitleURL: URL?
+}
+
+actor FFmpegTrackPreviewEngine {
+    private let executableURL: URL
+    private let runner: any CLIProcessRunning
+    private let commandBuilder: FFmpegCommandBuilder
+
+    init(
+        executableURL: URL,
+        runner: any CLIProcessRunning = ProcessRunner(),
+        commandBuilder: FFmpegCommandBuilder = FFmpegCommandBuilder()
+    ) {
+        self.executableURL = executableURL
+        self.runner = runner
+        self.commandBuilder = commandBuilder
+    }
+
+    func createPreview(_ request: TrackPreviewRequest) async throws -> TrackPreviewAsset {
+        let subtitleURL = request.tracks.contains(where: { $0.kind == .subtitle })
+            ? request.destinationURL.deletingPathExtension().appendingPathExtension("srt")
+            : nil
+        do {
+            try await createPlayableMedia(for: request)
+            if let subtitleURL {
+                let subtitleResult = try await runner.run(
+                    CLICommand(
+                        executableURL: executableURL,
+                        arguments: commandBuilder.previewSubtitleArguments(
+                            for: request,
+                            destinationURL: subtitleURL
+                        )
+                    )
+                )
+                try validate(subtitleResult, tool: "FFmpeg 字幕预览")
+            }
+            return TrackPreviewAsset(
+                mediaURL: request.destinationURL,
+                subtitleURL: subtitleURL
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: request.destinationURL)
+            if let subtitleURL {
+                try? FileManager.default.removeItem(at: subtitleURL)
+            }
+            throw error
+        }
+    }
+
+    private func createPlayableMedia(for request: TrackPreviewRequest) async throws {
+        let preferredResult = try await runner.run(
+            CLICommand(
+                executableURL: executableURL,
+                arguments: commandBuilder.previewArguments(for: request)
+            )
+        )
+        if preferredResult.succeeded,
+           await MediaPlaybackCompatibility.isPlayableVideo(at: request.destinationURL) {
+            return
+        }
+
+        try Task.checkCancellation()
+        try? FileManager.default.removeItem(at: request.destinationURL)
+
+        let compatibilityResult = try await runner.run(
+            CLICommand(
+                executableURL: executableURL,
+                arguments: commandBuilder.previewArguments(
+                    for: request,
+                    forceCompatibilityTranscode: true
+                )
+            )
+        )
+        try validate(compatibilityResult, tool: "FFmpeg 兼容预览")
+
+        guard await MediaPlaybackCompatibility.isPlayableVideo(at: request.destinationURL) else {
+            throw MediaEngineError.previewNotPlayable
+        }
+    }
+}
+
 struct FFmpegCommandBuilder: Sendable {
     func arguments(for request: ExportRequest) -> [String] {
+        if case let .trackExtraction(track) = request.operation {
+            return trackExtractionArguments(for: request, track: track)
+        }
+
         let configuration = request.configuration
         let editing = request.editing
         let usesComposition = editing.requiresFilterComposition
         let effectiveMode: ExportMode = usesComposition ? .transcode : configuration.mode
         let simpleTrimRange = editing.simpleTrimRange()
+        let usesOffsetSubtitleInput = abs(configuration.subtitles.timeOffsetSeconds) > 0.000_1
+            && configuration.subtitles.mode != .remove
+            && configuration.subtitles.mode != .burn
+            && !usesComposition
+        let inputPlan = FFmpegInputPlan(
+            primarySourceURL: request.sourceURL,
+            tracks: configuration.trackSettings.filter { track in
+                guard track.isIncluded else { return false }
+                return track.kind != .subtitle
+                    || (configuration.subtitles.mode != .remove
+                        && configuration.subtitles.mode != .burn
+                        && !usesComposition)
+            },
+            subtitleOffset: usesOffsetSubtitleInput ? configuration.subtitles.timeOffsetSeconds : nil,
+            includeFallbackSubtitleInput: configuration.trackSettings.isEmpty && usesOffsetSubtitleInput
+        )
         var arguments = [
             "-hide_banner",
             "-nostdin",
@@ -90,23 +201,8 @@ struct FFmpegCommandBuilder: Sendable {
             arguments += ["-hwaccel", "videotoolbox"]
         }
 
-        if effectiveMode == .streamCopy, let simpleTrimRange, simpleTrimRange.start > 0 {
-            arguments += ["-ss", formatTime(simpleTrimRange.start)]
-        }
-
-        arguments += ["-i", request.sourceURL.path]
-
-        let usesOffsetSubtitleInput = abs(configuration.subtitles.timeOffsetSeconds) > 0.000_1
-            && configuration.subtitles.mode != .remove
-            && configuration.subtitles.mode != .burn
-            && !usesComposition
-
-        if usesOffsetSubtitleInput {
-            arguments += [
-                "-itsoffset", formatTime(configuration.subtitles.timeOffsetSeconds),
-                "-i", request.sourceURL.path
-            ]
-        }
+        let inputSeek = effectiveMode == .streamCopy ? simpleTrimRange?.start : nil
+        arguments += inputPlan.arguments(inputSeek: inputSeek)
 
         if effectiveMode == .transcode,
            !usesComposition,
@@ -119,10 +215,11 @@ struct FFmpegCommandBuilder: Sendable {
         }
 
         if usesComposition {
-            arguments += compositionArguments(for: request)
+            arguments += compositionArguments(for: request, inputPlan: inputPlan)
         } else {
             arguments += mappingArguments(
                 configuration: configuration,
+                inputPlan: inputPlan,
                 usesOffsetSubtitleInput: usesOffsetSubtitleInput
             )
         }
@@ -144,11 +241,27 @@ struct FFmpegCommandBuilder: Sendable {
         }
 
         arguments += containerArguments(configuration: configuration)
+        arguments += playbackTagArguments(
+            configuration: configuration,
+            effectiveMode: effectiveMode
+        )
         arguments += trackMetadataArguments(
             configuration: configuration,
             usesComposition: usesComposition
         )
         arguments += metadataArguments(configuration: configuration)
+
+        if !usesComposition,
+           simpleTrimRange == nil,
+           configuration.trackSettings.contains(where: {
+               $0.isIncluded
+                   && $0.resolvedSourceURL(primarySourceURL: request.sourceURL).standardizedFileURL
+                       != request.sourceURL.standardizedFileURL
+           }),
+           let duration = editing.trimmedDuration ?? request.sourceDuration,
+           duration > 0 {
+            arguments += ["-t", formatTime(duration)]
+        }
 
         if configuration.advanced.threadCount > 0 {
             arguments += ["-threads", String(configuration.advanced.threadCount)]
@@ -165,8 +278,186 @@ struct FFmpegCommandBuilder: Sendable {
             .joined(separator: " ")
     }
 
+    func previewArguments(
+        for request: TrackPreviewRequest,
+        forceCompatibilityTranscode: Bool = false
+    ) -> [String] {
+        let inputPlan = FFmpegInputPlan(
+            primarySourceURL: request.primarySourceURL,
+            tracks: request.tracks.filter { $0.kind != .subtitle },
+            subtitleOffset: nil,
+            includeFallbackSubtitleInput: false
+        )
+        var result = ["-hide_banner", "-nostdin", "-y"]
+        result += inputPlan.arguments(inputSeek: nil)
+
+        for track in request.tracks where track.kind != .subtitle {
+            result += ["-map", "\(inputPlan.inputIndex(for: track)):\(track.streamIndex)"]
+        }
+        result += previewVideoArguments(
+            for: request.tracks.first { $0.kind == .video },
+            forceCompatibilityTranscode: forceCompatibilityTranscode
+        )
+        result += previewAudioArguments(
+            for: request.tracks.first { $0.kind == .audio },
+            forceCompatibilityTranscode: forceCompatibilityTranscode
+        )
+        result += ["-sn"]
+        result += ["-map_metadata", "0", "-map_chapters", "0"]
+
+        for kind in [MediaStreamKind.video, .audio] {
+            guard let track = request.tracks.first(where: { $0.kind == kind }) else { continue }
+            let specifier = kind == .video ? "v" : "a"
+            if !track.title.isEmpty {
+                result += ["-metadata:s:\(specifier):0", "title=\(track.title)"]
+                result += ["-metadata:s:\(specifier):0", "handler_name=\(track.title)"]
+            }
+            if !track.language.isEmpty {
+                result += ["-metadata:s:\(specifier):0", "language=\(track.language)"]
+            }
+            result += ["-disposition:\(specifier):0", "default"]
+        }
+        if let duration = request.duration, duration > 0 {
+            result += ["-t", formatTime(duration)]
+        }
+        result += ["-movflags", "+faststart", request.destinationURL.path]
+        return result
+    }
+
+    func previewSubtitleArguments(
+        for request: TrackPreviewRequest,
+        destinationURL: URL
+    ) -> [String] {
+        guard let track = request.tracks.first(where: { $0.kind == .subtitle }) else {
+            return []
+        }
+        let sourceURL = track.resolvedSourceURL(primarySourceURL: request.primarySourceURL)
+        var result = ["-hide_banner", "-nostdin", "-y"]
+        if abs(request.subtitleOffset) > 0.000_1 {
+            result += ["-itsoffset", decimal(request.subtitleOffset)]
+        }
+        result += [
+            "-i", sourceURL.path,
+            "-map", "0:\(track.streamIndex)",
+            "-c:s", "srt"
+        ]
+        if let duration = request.duration, duration > 0 {
+            result += ["-t", formatTime(duration)]
+        }
+        result.append(destinationURL.path)
+        return result
+    }
+
+    private func previewVideoArguments(
+        for track: TrackExportSettings?,
+        forceCompatibilityTranscode: Bool
+    ) -> [String] {
+        guard let track else { return ["-vn"] }
+        if forceCompatibilityTranscode {
+            return [
+                "-c:v", "h264_videotoolbox",
+                "-allow_sw", "1",
+                "-profile:v", "high",
+                "-b:v", "6000k",
+                "-vf",
+                "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,format=yuv420p",
+                "-pix_fmt", "yuv420p",
+                "-tag:v", "avc1"
+            ]
+        }
+
+        switch track.codecName?.lowercased() {
+        case "h264":
+            return ["-c:v", "copy", "-tag:v", "avc1"]
+        case "hevc", "h265":
+            return ["-c:v", "copy", "-tag:v", "hvc1"]
+        case "mpeg4", "prores", "mjpeg":
+            return ["-c:v", "copy"]
+        default:
+            return [
+                "-c:v", "h264_videotoolbox",
+                "-allow_sw", "1",
+                "-b:v", "6000k",
+                "-pix_fmt", "yuv420p",
+                "-tag:v", "avc1"
+            ]
+        }
+    }
+
+    private func previewAudioArguments(
+        for track: TrackExportSettings?,
+        forceCompatibilityTranscode: Bool
+    ) -> [String] {
+        guard let track else { return ["-an"] }
+        if forceCompatibilityTranscode {
+            return ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+        }
+        let copyCompatibleCodecs = Set(["aac", "alac", "mp3", "ac3", "eac3"])
+        if let codec = track.codecName?.lowercased(), copyCompatibleCodecs.contains(codec) {
+            return ["-c:a", "copy"]
+        }
+        return ["-c:a", "aac", "-b:a", "192k"]
+    }
+
+    private func trackExtractionArguments(
+        for request: ExportRequest,
+        track: TrackExportSettings
+    ) -> [String] {
+        let sourceURL = track.resolvedSourceURL(primarySourceURL: request.sourceURL)
+        var result = [
+            "-hide_banner",
+            "-nostdin",
+            request.configuration.advanced.overwriteExisting ? "-y" : "-n",
+            "-i", sourceURL.path,
+            "-map", "0:\(track.streamIndex)",
+            "-map_metadata", "-1",
+            "-map_chapters", "-1"
+        ]
+
+        if track.kind == .subtitle {
+            switch request.destinationURL.pathExtension.lowercased() {
+            case "srt": result += ["-c:s", "srt"]
+            case "ass", "ssa": result += ["-c:s", "ass"]
+            case "vtt": result += ["-c:s", "webvtt"]
+            default: result += ["-c", "copy"]
+            }
+        } else {
+            result += ["-c", "copy"]
+        }
+
+        let specifier: String
+        switch track.kind {
+        case .video: specifier = "v"
+        case .audio: specifier = "a"
+        case .subtitle: specifier = "s"
+        default: specifier = ""
+        }
+        if !specifier.isEmpty {
+            if !track.title.isEmpty {
+                result += ["-metadata:s:\(specifier):0", "title=\(track.title)"]
+                if ["mov", "mp4", "m4a"].contains(request.destinationURL.pathExtension.lowercased()) {
+                    result += ["-metadata:s:\(specifier):0", "handler_name=\(track.title)"]
+                }
+            }
+            if !track.language.isEmpty {
+                result += ["-metadata:s:\(specifier):0", "language=\(track.language)"]
+            }
+            result += ["-disposition:\(specifier):0", track.isDefault ? "default" : "0"]
+        }
+        if ["mov", "mp4", "m4a"].contains(request.destinationURL.pathExtension.lowercased()) {
+            if track.kind == .video,
+               let tag = quickTimeVideoTag(for: track.codecName) {
+                result += ["-tag:v:0", tag]
+            }
+            result += ["-movflags", "+faststart"]
+        }
+        result.append(request.destinationURL.path)
+        return result
+    }
+
     private func mappingArguments(
         configuration: ExportConfiguration,
+        inputPlan: FFmpegInputPlan,
         usesOffsetSubtitleInput: Bool
     ) -> [String] {
         var result: [String] = []
@@ -181,10 +472,9 @@ struct FFmpegCommandBuilder: Sendable {
                     }
                     return true
                 }
-                .sorted { $0.streamIndex < $1.streamIndex }
 
             for track in includedTracks {
-                let inputIndex = usesOffsetSubtitleInput && track.kind == .subtitle ? 1 : 0
+                let inputIndex = inputPlan.inputIndex(for: track)
                 result += ["-map", "\(inputIndex):\(track.streamIndex)?"]
             }
             if configuration.includeAttachments {
@@ -194,7 +484,12 @@ struct FFmpegCommandBuilder: Sendable {
                 result += ["-map", "0:d?"]
             }
         } else if usesOffsetSubtitleInput {
-            result += ["-map", "0:v?", "-map", "0:a?", "-map", "1:s?"]
+            let subtitleInputIndex = inputPlan.fallbackSubtitleInputIndex ?? 1
+            result += [
+                "-map", "0:v?",
+                "-map", "0:a?",
+                "-map", "\(subtitleInputIndex):s?"
+            ]
             if configuration.streamSelection == .all, configuration.includeAttachments {
                 result += ["-map", "0:t?"]
             }
@@ -221,13 +516,16 @@ struct FFmpegCommandBuilder: Sendable {
         return result
     }
 
-    private func compositionArguments(for request: ExportRequest) -> [String] {
+    private func compositionArguments(
+        for request: ExportRequest,
+        inputPlan: FFmpegInputPlan
+    ) -> [String] {
         let clips = request.editing.clips
         guard !clips.isEmpty else { return [] }
 
         let configuration = request.configuration
-        let videoInput = selectedVideoInput(configuration: configuration)
-        let audioInputs = selectedAudioInputs(configuration: configuration)
+        let videoInput = selectedVideoInput(configuration: configuration, inputPlan: inputPlan)
+        let audioInputs = selectedAudioInputs(configuration: configuration, inputPlan: inputPlan)
         let clipCount = clips.count
         let canvas = compositionCanvasDimensions(for: request)
         var graph: [String] = []
@@ -307,22 +605,26 @@ struct FFmpegCommandBuilder: Sendable {
         return result
     }
 
-    private func selectedVideoInput(configuration: ExportConfiguration) -> String {
-        if let streamIndex = configuration.trackSettings
+    private func selectedVideoInput(
+        configuration: ExportConfiguration,
+        inputPlan: FFmpegInputPlan
+    ) -> String {
+        if let track = configuration.trackSettings
             .filter({ $0.kind == .video && $0.isIncluded })
-            .sorted(by: { $0.streamIndex < $1.streamIndex })
-            .first?.streamIndex {
-            return "[0:\(streamIndex)]"
+            .first {
+            return "[\(inputPlan.inputIndex(for: track)):\(track.streamIndex)]"
         }
         return "[0:v:0]"
     }
 
-    private func selectedAudioInputs(configuration: ExportConfiguration) -> [String] {
+    private func selectedAudioInputs(
+        configuration: ExportConfiguration,
+        inputPlan: FFmpegInputPlan
+    ) -> [String] {
         guard configuration.audio.codec != .none else { return [] }
         return configuration.trackSettings
             .filter { $0.kind == .audio && $0.isIncluded }
-            .sorted { $0.streamIndex < $1.streamIndex }
-            .map { "[0:\($0.streamIndex)]" }
+            .map { "[\(inputPlan.inputIndex(for: $0)):\($0.streamIndex)]" }
     }
 
     private func clipVideoFilters(
@@ -588,9 +890,17 @@ struct FFmpegCommandBuilder: Sendable {
         case .copy:
             ["-c:s", "copy"]
         case .convert:
-            ["-c:s", configuration.container == .mp4 || configuration.container == .mov ? "mov_text" : "srt"]
+            ["-c:s", subtitleCodec(for: configuration.container)]
         case .burn, .remove:
             ["-sn"]
+        }
+    }
+
+    private func subtitleCodec(for container: MediaContainer) -> String {
+        switch container {
+        case .mp4, .mov: "mov_text"
+        case .webm: "webvtt"
+        case .mkv: "srt"
         }
     }
 
@@ -615,6 +925,42 @@ struct FFmpegCommandBuilder: Sendable {
         return result
     }
 
+    private func playbackTagArguments(
+        configuration: ExportConfiguration,
+        effectiveMode: ExportMode
+    ) -> [String] {
+        guard configuration.container == .mp4 || configuration.container == .mov else {
+            return []
+        }
+
+        if effectiveMode == .transcode {
+            switch configuration.video.codec {
+            case .h264VideoToolbox, .h264:
+                return ["-tag:v", "avc1"]
+            case .hevcVideoToolbox, .hevc:
+                return ["-tag:v", "hvc1"]
+            case .av1, .proRes:
+                return []
+            }
+        }
+
+        return configuration.trackSettings
+            .filter { $0.kind == .video && $0.isIncluded }
+            .enumerated()
+            .flatMap { outputIndex, track -> [String] in
+                guard let tag = quickTimeVideoTag(for: track.codecName) else { return [] }
+                return ["-tag:v:\(outputIndex)", tag]
+            }
+    }
+
+    private func quickTimeVideoTag(for codecName: String?) -> String? {
+        switch codecName?.lowercased() {
+        case "h264": "avc1"
+        case "hevc", "h265": "hvc1"
+        default: nil
+        }
+    }
+
     private func trackMetadataArguments(
         configuration: ExportConfiguration,
         usesComposition: Bool
@@ -635,7 +981,6 @@ struct FFmpegCommandBuilder: Sendable {
 
             var tracks = configuration.trackSettings
                 .filter { $0.kind == kind && $0.isIncluded }
-                .sorted { $0.streamIndex < $1.streamIndex }
             if usesComposition, kind == .video {
                 tracks = Array(tracks.prefix(1))
             }
@@ -650,6 +995,12 @@ struct FFmpegCommandBuilder: Sendable {
             for (outputIndex, track) in tracks.enumerated() {
                 if !track.title.isEmpty {
                     result += ["-metadata:s:\(specifier):\(outputIndex)", "title=\(track.title)"]
+                    if configuration.container == .mp4 || configuration.container == .mov {
+                        result += [
+                            "-metadata:s:\(specifier):\(outputIndex)",
+                            "handler_name=\(track.title)"
+                        ]
+                    }
                 }
                 if !track.language.isEmpty {
                     result += ["-metadata:s:\(specifier):\(outputIndex)", "language=\(track.language)"]
@@ -708,6 +1059,85 @@ struct FFmpegCommandBuilder: Sendable {
     }
 }
 
+private struct FFmpegInputPlan {
+    struct Entry {
+        let sourceURL: URL
+        let subtitleOffset: TimeInterval?
+    }
+
+    let entries: [Entry]
+    let fallbackSubtitleInputIndex: Int?
+    private let trackInputIndices: [String: Int]
+
+    init(
+        primarySourceURL: URL,
+        tracks: [TrackExportSettings],
+        subtitleOffset: TimeInterval?,
+        includeFallbackSubtitleInput: Bool
+    ) {
+        var plannedEntries = [Entry(sourceURL: primarySourceURL, subtitleOffset: nil)]
+        var indicesByKey = [Self.key(for: primarySourceURL, subtitleOffset: nil): 0]
+        var indicesByTrack: [String: Int] = [:]
+
+        for track in tracks {
+            let sourceURL = track.resolvedSourceURL(primarySourceURL: primarySourceURL)
+            let offset = track.kind == .subtitle ? subtitleOffset : nil
+            let key = Self.key(for: sourceURL, subtitleOffset: offset)
+            let inputIndex: Int
+            if let existingIndex = indicesByKey[key] {
+                inputIndex = existingIndex
+            } else {
+                inputIndex = plannedEntries.count
+                plannedEntries.append(Entry(sourceURL: sourceURL, subtitleOffset: offset))
+                indicesByKey[key] = inputIndex
+            }
+            indicesByTrack[track.id] = inputIndex
+        }
+
+        var fallbackIndex: Int?
+        if includeFallbackSubtitleInput, let subtitleOffset {
+            let key = Self.key(for: primarySourceURL, subtitleOffset: subtitleOffset)
+            if let existingIndex = indicesByKey[key] {
+                fallbackIndex = existingIndex
+            } else {
+                fallbackIndex = plannedEntries.count
+                plannedEntries.append(Entry(sourceURL: primarySourceURL, subtitleOffset: subtitleOffset))
+            }
+        }
+
+        entries = plannedEntries
+        trackInputIndices = indicesByTrack
+        fallbackSubtitleInputIndex = fallbackIndex
+    }
+
+    func inputIndex(for track: TrackExportSettings) -> Int {
+        trackInputIndices[track.id] ?? 0
+    }
+
+    func arguments(inputSeek: TimeInterval?) -> [String] {
+        entries.flatMap { entry in
+            var result: [String] = []
+            if let inputSeek, inputSeek > 0 {
+                result += ["-ss", Self.decimal(inputSeek)]
+            }
+            if let offset = entry.subtitleOffset, abs(offset) > 0.000_1 {
+                result += ["-itsoffset", Self.decimal(offset)]
+            }
+            result += ["-i", entry.sourceURL.path]
+            return result
+        }
+    }
+
+    private static func key(for sourceURL: URL, subtitleOffset: TimeInterval?) -> String {
+        let offset = subtitleOffset.map(decimal) ?? "none"
+        return "\(sourceURL.standardizedFileURL.path)::\(offset)"
+    }
+
+    private static func decimal(_ value: Double) -> String {
+        String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), value)
+    }
+}
+
 private func ensureDestinationDoesNotExist(_ url: URL) throws {
     guard !FileManager.default.fileExists(atPath: url.path) else {
         throw MediaEngineError.destinationAlreadyExists(url)
@@ -746,6 +1176,13 @@ private struct FFprobePayload: Decodable {
         struct Tags: Decodable {
             let language: String?
             let title: String?
+            let handlerName: String?
+
+            enum CodingKeys: String, CodingKey {
+                case language
+                case title
+                case handlerName = "handler_name"
+            }
         }
 
         struct Disposition: Decodable {
@@ -841,7 +1278,7 @@ private struct FFprobePayload: Decodable {
                     sampleRate: stream.sampleRate.flatMap(Int.init),
                     channels: stream.channels,
                     language: stream.tags?.language,
-                    title: stream.tags?.title,
+                    title: preferredTrackTitle(from: stream.tags),
                     isDefault: stream.disposition?.isDefault == 1,
                     bitRate: stream.bitRate.flatMap(Int64.init),
                     pixelFormat: stream.pixelFormat,
@@ -866,5 +1303,25 @@ private struct FFprobePayload: Decodable {
                 )
             }
         )
+    }
+
+    private func preferredTrackTitle(from tags: Stream.Tags?) -> String? {
+        if let title = tags?.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            return title
+        }
+
+        guard let handlerName = tags?.handlerName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !handlerName.isEmpty else { return nil }
+        let genericHandlerNames: Set<String> = [
+            "videohandler",
+            "soundhandler",
+            "subtitlehandler",
+            "mediahandler",
+            "datahandler",
+            "core media video",
+            "core media audio"
+        ]
+        return genericHandlerNames.contains(handlerName.lowercased()) ? nil : handlerName
     }
 }

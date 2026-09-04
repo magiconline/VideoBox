@@ -4,9 +4,26 @@ All notable changes to VideoBox are documented here. / VideoBox 的重要变更�
 
 ## Unreleased / 未发布
 
+## [0.2.1] - 2026-09-05
+
+### English
+
+- Add independent import, extraction, and same-kind ordering for video, audio, and subtitle tracks in the track and metadata workspace.
+- Preview selected external video/audio tracks and timed text subtitles directly in the player without exporting a finished video first.
+- Unify media preparation behind a single loading progress bar and remove compatibility-mode badges and automatic-switch notices.
+- Make HEVC previews and QuickTime exports Apple-compatible with `hvc1`, validate generated previews with AVFoundation, and automatically transcode unsupported video/audio combinations.
+- Add bundled dav1d software decoding so AV1 sources can generate compatible previews on Macs without AV1 hardware decoding.
 - Build DMGs from a temporary app bundle so `dist/` no longer leaves a duplicate `VideoBox.app` indexed by Spotlight.
-- DMG 打包改用临时 App Bundle，避免 `dist/` 中残留被 Spotlight 索引的重复 `VideoBox.app`。
 - Make the default project introduction Chinese-only and highlight lossless track selection and container remuxing.
+
+### 中文
+
+- 在“轨道与元数据”中新增视频、音频和字幕轨道的独立导入、提取导出及同类型排序。
+- 外部视频/音频轨道和文本字幕可直接在播放器中按时间轴预览，无需先导出成片。
+- 所有视频格式统一使用加载进度条，无需向用户显示兼容模式或自动切换提示。
+- HEVC 预览及 QuickTime 导出自动使用 Apple 兼容的 `hvc1`；生成后由 AVFoundation 验证，必要时自动将不兼容音视频转为兼容预览。
+- 内置 dav1d 软件解码，使不支持 AV1 硬件解码的 Mac 也能为 AV1 片源生成兼容预览。
+- DMG 打包改用临时 App Bundle，避免 `dist/` 中残留被 Spotlight 索引的重复 `VideoBox.app`。
 - 默认项目简介改为纯中文，并重点说明无需重新压缩的轨道调整与封装转换能力。
 
 ## [0.2.0] - 2026-09-04

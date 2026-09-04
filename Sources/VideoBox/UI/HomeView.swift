@@ -15,8 +15,9 @@ struct HomeView: View {
     @State private var isShowingImporter = false
     @State private var isShowingQueue = false
     @State private var isDropTarget = false
-    @State private var isProbing = false
+    @State private var isLoadingVideo = false
     @State private var feedback: EditorFeedback?
+    @State private var mediaLoadTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -25,7 +26,7 @@ struct HomeView: View {
                     EditorView(
                         asset: selectedAsset,
                         mediaProbe: mediaProbe,
-                        isProbing: isProbing,
+                        isLoadingVideo: isLoadingVideo,
                         playerController: playerController,
                         configuration: $configuration,
                         editing: $editing,
@@ -85,6 +86,7 @@ struct HomeView: View {
             await environment.refreshToolchain()
         }
         .onDisappear {
+            mediaLoadTask?.cancel()
             playerController.pause()
         }
     }
@@ -131,11 +133,12 @@ struct HomeView: View {
     }
 
     private func openVideo(_ url: URL) {
+        mediaLoadTask?.cancel()
         let asset = MediaAsset(url: url)
         selectedAsset = asset
         playerController.load(url: url)
         mediaProbe = nil
-        isProbing = true
+        isLoadingVideo = true
         feedback = nil
         editing = EditSettings()
         configuration = ExportConfiguration()
@@ -143,7 +146,7 @@ struct HomeView: View {
         outputDirectoryURL = url.deletingLastPathComponent()
         outputFileName = "\(url.deletingPathExtension().lastPathComponent)-VideoBox"
 
-        Task { @MainActor in
+        mediaLoadTask = Task { @MainActor in
             do {
                 let probe = try await environment.probeMedia(at: url)
                 guard selectedAsset?.url == url else { return }
@@ -155,35 +158,64 @@ struct HomeView: View {
                         canvasHeight: probe.primaryVideoStream?.height
                     )
                 }
-                configuration.trackSettings = probe.streams
+                let trackSettings = probe.streams
                     .filter {
                         [.video, .audio, .subtitle].contains($0.kind)
                             && !$0.isAttachedPicture
                     }
                     .map { stream in
                         TrackExportSettings(
-                            streamIndex: stream.index,
-                            kind: stream.kind,
-                            title: stream.title ?? "",
-                            language: stream.language ?? "",
-                            isDefault: stream.isDefault
+                            sourceURL: url,
+                            stream: stream,
+                            sourceDuration: probe.duration
                         )
                     }
+                configuration.trackSettings = trackSettings
                 configuration.metadataEntries = probe.metadata
                     .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
                     .map { MetadataExportEntry(key: $0.key, value: $0.value) }
+                if !(await MediaPlaybackCompatibility.isPlayableVideo(at: url)) {
+                    var selection = TrackPreviewSelection()
+                    selection.normalize(using: trackSettings)
+                    let previewAsset = try await environment.createTrackPreview(
+                        primarySourceURL: url,
+                        tracks: selection.selectedTracks(from: trackSettings),
+                        duration: probe.duration,
+                        subtitleOffset: 0
+                    )
+                    guard !Task.isCancelled,
+                          selectedAsset?.url == url,
+                          playerController.sourceURL == url else {
+                        try? FileManager.default.removeItem(at: previewAsset.mediaURL)
+                        if let subtitleURL = previewAsset.subtitleURL {
+                            try? FileManager.default.removeItem(at: subtitleURL)
+                        }
+                        return
+                    }
+                    try playerController.loadTrackPreview(
+                        mediaURL: previewAsset.mediaURL,
+                        subtitleURL: previewAsset.subtitleURL,
+                        preservingTime: true,
+                        resumesPlayback: playerController.isPlaying
+                    )
+                }
             } catch {
+                if error is CancellationError { return }
                 guard selectedAsset?.url == url else { return }
-                feedback = .warning(error.localizedDescription)
+                feedback = .error("视频加载失败，请检查文件是否完整或尝试其他文件。")
             }
-            isProbing = false
+            guard !Task.isCancelled, selectedAsset?.url == url else { return }
+            isLoadingVideo = false
         }
     }
 
     private func closeVideo() {
-        playerController.pause()
+        mediaLoadTask?.cancel()
+        mediaLoadTask = nil
+        playerController.clear()
         selectedAsset = nil
         mediaProbe = nil
+        isLoadingVideo = false
         feedback = nil
         outputDirectoryURL = nil
     }
@@ -206,6 +238,14 @@ struct HomeView: View {
         guard let selectedAsset, let outputDirectoryURL else { return }
         guard isFFmpegAvailable else {
             feedback = .error("未检测到 FFmpeg，当前无法导出。")
+            return
+        }
+        if let validationMessage = validateTrackExport(
+            primarySourceURL: selectedAsset.url,
+            configuration: configuration,
+            editing: editing
+        ) {
+            feedback = .error(validationMessage)
             return
         }
 
@@ -237,6 +277,69 @@ struct HomeView: View {
         )
         environment.enqueueExport(request)
         feedback = .success("已开始导出：\(destinationURL.lastPathComponent)")
+    }
+
+    private func validateTrackExport(
+        primarySourceURL: URL,
+        configuration: ExportConfiguration,
+        editing: EditSettings
+    ) -> String? {
+        guard !configuration.trackSettings.isEmpty else { return nil }
+        let includedTracks = configuration.trackSettings.filter(\.isIncluded)
+        guard includedTracks.contains(where: { $0.kind == .video }) else {
+            return "成片导出至少需要启用一条视频轨道。"
+        }
+
+        let usedTracks = includedTracks.filter {
+            !($0.kind == .subtitle
+                && (configuration.subtitles.mode == .remove || configuration.subtitles.mode == .burn))
+        }
+        if let missingTrack = usedTracks.first(where: {
+            !FileManager.default.fileExists(
+                atPath: $0.resolvedSourceURL(primarySourceURL: primarySourceURL).path
+            )
+        }) {
+            let sourceURL = missingTrack.resolvedSourceURL(primarySourceURL: primarySourceURL)
+            return "轨道源文件已不可用：\(sourceURL.lastPathComponent)"
+        }
+
+        if editing.requiresFilterComposition {
+            let videoCount = includedTracks.filter { $0.kind == .video }.count
+            if videoCount > 1 {
+                return "片段剪切、重排或变速时只能保留一条视频轨道；请关闭其他视频轨道后再导出。"
+            }
+            if includedTracks.contains(where: { $0.kind == .subtitle }),
+               configuration.subtitles.mode == .copy || configuration.subtitles.mode == .convert {
+                return "片段剪切、重排或变速后无法直接保留软字幕；请选择烧录字幕或移除字幕。"
+            }
+        }
+
+        guard configuration.mode == .streamCopy else { return nil }
+        let codecsByKind: (MediaStreamKind) -> [String] = { kind in
+            includedTracks
+                .filter { $0.kind == kind }
+                .compactMap { $0.codecName?.lowercased() }
+        }
+
+        if configuration.container == .mp4 || configuration.container == .mov {
+            let unsupportedSubtitles = codecsByKind(.subtitle).filter { $0 != "mov_text" }
+            if !unsupportedSubtitles.isEmpty, configuration.subtitles.mode == .copy {
+                return "当前字幕编码不适合 \(configuration.container.displayName)，请将字幕处理方式改为“转换为容器兼容格式”。"
+            }
+        }
+        if configuration.container == .webm {
+            let supportedVideo = Set(["vp8", "vp9", "av1"])
+            let supportedAudio = Set(["opus", "vorbis"])
+            if codecsByKind(.video).contains(where: { !supportedVideo.contains($0) })
+                || codecsByKind(.audio).contains(where: { !supportedAudio.contains($0) }) {
+                return "WebM 无法直接容纳当前启用的编码；请选择压缩导出、更换容器或关闭不兼容轨道。"
+            }
+            if includedTracks.contains(where: { $0.kind == .subtitle }),
+               configuration.subtitles.mode == .copy {
+                return "WebM 字幕需要转换为 WebVTT，请将字幕处理方式设为转换。"
+            }
+        }
+        return nil
     }
 }
 

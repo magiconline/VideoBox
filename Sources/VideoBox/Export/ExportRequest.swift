@@ -6,20 +6,28 @@ struct ExportRequest: Codable, Equatable, Sendable {
     var sourceDuration: TimeInterval?
     var configuration: ExportConfiguration
     var editing: EditSettings
+    var operation: ExportOperation
 
     init(
         sourceURL: URL,
         destinationURL: URL,
         sourceDuration: TimeInterval? = nil,
         configuration: ExportConfiguration,
-        editing: EditSettings
+        editing: EditSettings,
+        operation: ExportOperation = .media
     ) {
         self.sourceURL = sourceURL
         self.destinationURL = destinationURL
         self.sourceDuration = sourceDuration
         self.configuration = configuration
         self.editing = editing
+        self.operation = operation
     }
+}
+
+enum ExportOperation: Codable, Equatable, Sendable {
+    case media
+    case trackExtraction(TrackExportSettings)
 }
 
 struct ExportConfiguration: Codable, Equatable, Sendable {
@@ -38,29 +46,186 @@ struct ExportConfiguration: Codable, Equatable, Sendable {
 }
 
 struct TrackExportSettings: Codable, Equatable, Identifiable, Sendable {
+    var sourceURL: URL?
     var streamIndex: Int
     var kind: MediaStreamKind
     var isIncluded: Bool
     var title: String
     var language: String
     var isDefault: Bool
+    var codecName: String?
+    var width: Int?
+    var height: Int?
+    var sampleRate: Int?
+    var channels: Int?
+    var sourceDuration: TimeInterval?
 
-    var id: Int { streamIndex }
+    var id: String {
+        let sourceIdentity = sourceURL?.standardizedFileURL.path ?? "__primary__"
+        return "\(sourceIdentity)::\(kind.rawValue)::\(streamIndex)"
+    }
 
     init(
+        sourceURL: URL? = nil,
         streamIndex: Int,
         kind: MediaStreamKind,
         isIncluded: Bool = true,
         title: String = "",
         language: String = "",
-        isDefault: Bool = false
+        isDefault: Bool = false,
+        codecName: String? = nil,
+        width: Int? = nil,
+        height: Int? = nil,
+        sampleRate: Int? = nil,
+        channels: Int? = nil,
+        sourceDuration: TimeInterval? = nil
     ) {
+        self.sourceURL = sourceURL
         self.streamIndex = streamIndex
         self.kind = kind
         self.isIncluded = isIncluded
         self.title = title
         self.language = language
         self.isDefault = isDefault
+        self.codecName = codecName
+        self.width = width
+        self.height = height
+        self.sampleRate = sampleRate
+        self.channels = channels
+        self.sourceDuration = sourceDuration
+    }
+
+    init(sourceURL: URL, stream: MediaStream, sourceDuration: TimeInterval?) {
+        self.init(
+            sourceURL: sourceURL,
+            streamIndex: stream.index,
+            kind: stream.kind,
+            title: stream.title ?? "",
+            language: stream.language ?? "",
+            isDefault: stream.isDefault,
+            codecName: stream.codecName,
+            width: stream.width,
+            height: stream.height,
+            sampleRate: stream.sampleRate,
+            channels: stream.channels,
+            sourceDuration: sourceDuration
+        )
+    }
+
+    func resolvedSourceURL(primarySourceURL: URL) -> URL {
+        sourceURL ?? primarySourceURL
+    }
+
+    func isImported(relativeTo primarySourceURL: URL) -> Bool {
+        resolvedSourceURL(primarySourceURL: primarySourceURL).standardizedFileURL
+            != primarySourceURL.standardizedFileURL
+    }
+
+    var suggestedExtractionExtension: String {
+        let codec = codecName?.lowercased() ?? ""
+        switch kind {
+        case .video:
+            return ["h264", "hevc", "h265", "mpeg4", "prores"].contains(codec) ? "mov" : "mkv"
+        case .audio:
+            switch codec {
+            case "aac", "alac": return "m4a"
+            case "mp3": return "mp3"
+            case "flac": return "flac"
+            case "opus": return "opus"
+            case "vorbis": return "ogg"
+            case let value where value.hasPrefix("pcm_"): return "wav"
+            default: return "mka"
+            }
+        case .subtitle:
+            switch codec {
+            case "ass", "ssa": return "ass"
+            case "webvtt": return "vtt"
+            case "hdmv_pgs_subtitle": return "sup"
+            case "dvd_subtitle", "dvb_subtitle", "dvb_teletext", "xsub", "arib_caption":
+                return "mkv"
+            default: return "srt"
+            }
+        default:
+            return "mkv"
+        }
+    }
+}
+
+struct TrackPreviewSelection: Equatable, Sendable {
+    var videoTrackID: String?
+    var audioTrackID: String?
+    var subtitleTrackID: String?
+
+    mutating func select(_ track: TrackExportSettings) {
+        switch track.kind {
+        case .video: videoTrackID = track.id
+        case .audio: audioTrackID = track.id
+        case .subtitle: subtitleTrackID = track.id
+        default: break
+        }
+    }
+
+    mutating func normalize(using tracks: [TrackExportSettings]) {
+        videoTrackID = normalizedID(videoTrackID, kind: .video, tracks: tracks)
+        audioTrackID = normalizedID(audioTrackID, kind: .audio, tracks: tracks)
+
+        let subtitles = tracks.filter { $0.kind == .subtitle }
+        if let subtitleTrackID, !subtitles.contains(where: { $0.id == subtitleTrackID }) {
+            self.subtitleTrackID = subtitles.first(where: { $0.isIncluded && $0.isDefault })?.id
+        }
+    }
+
+    func selectedTracks(from tracks: [TrackExportSettings]) -> [TrackExportSettings] {
+        var normalized = self
+        normalized.normalize(using: tracks)
+        return [
+            normalized.videoTrackID.flatMap { id in tracks.first { $0.id == id } },
+            normalized.audioTrackID.flatMap { id in tracks.first { $0.id == id } },
+            normalized.subtitleTrackID.flatMap { id in tracks.first { $0.id == id } }
+        ].compactMap { $0 }
+    }
+
+    private func normalizedID(
+        _ requestedID: String?,
+        kind: MediaStreamKind,
+        tracks: [TrackExportSettings]
+    ) -> String? {
+        let matching = tracks.filter { $0.kind == kind }
+        if let requestedID, matching.contains(where: { $0.id == requestedID }) {
+            return requestedID
+        }
+        return matching.first(where: { $0.isIncluded && $0.isDefault })?.id
+            ?? matching.first(where: \.isIncluded)?.id
+            ?? matching.first?.id
+    }
+}
+
+extension ExportConfiguration {
+    mutating func moveTrack(id: String, to targetID: String) {
+        guard id != targetID,
+              let moving = trackSettings.first(where: { $0.id == id }),
+              let target = trackSettings.first(where: { $0.id == targetID }),
+              moving.kind == target.kind else { return }
+
+        let positions = trackSettings.indices.filter { trackSettings[$0].kind == moving.kind }
+        var orderedTracks = positions.map { trackSettings[$0] }
+        guard let sourceIndex = orderedTracks.firstIndex(where: { $0.id == id }),
+              let targetIndex = orderedTracks.firstIndex(where: { $0.id == targetID }) else { return }
+
+        let item = orderedTracks.remove(at: sourceIndex)
+        orderedTracks.insert(item, at: min(targetIndex, orderedTracks.count))
+        for (position, track) in zip(positions, orderedTracks) {
+            trackSettings[position] = track
+        }
+    }
+
+    mutating func moveTrack(id: String, by offset: Int) {
+        guard let moving = trackSettings.first(where: { $0.id == id }) else { return }
+        let matching = trackSettings.filter { $0.kind == moving.kind }
+        guard let index = matching.firstIndex(where: { $0.id == id }) else { return }
+        let target = min(max(0, index + offset), matching.count - 1)
+        guard target != index else { return }
+        moveTrack(id: id, to: matching[target].id)
     }
 }
 

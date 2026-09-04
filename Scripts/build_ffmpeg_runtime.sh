@@ -45,10 +45,10 @@ else
 fi
 runtime_root="$build_root/$runtime_architecture_label"
 
-for required_tool in curl shasum tar make cmake nasm pkg-config xcrun lipo libtool otool; do
+for required_tool in curl shasum tar make cmake meson ninja nasm pkg-config xcrun lipo libtool otool; do
     if ! command -v "$required_tool" >/dev/null 2>&1; then
         print -u2 "Missing FFmpeg build tool: $required_tool"
-        print -u2 "Install local build prerequisites with: brew install cmake nasm pkgconf"
+        print -u2 "Install local build prerequisites with: brew install cmake meson ninja nasm pkgconf"
         exit 1
     fi
 done
@@ -104,6 +104,7 @@ source_directories=(
     "$X265_SOURCE_DIR"
     "$OPUS_SOURCE_DIR"
     "$SVT_AV1_SOURCE_DIR"
+    "$DAV1D_SOURCE_DIR"
     "$LIBASS_SOURCE_DIR"
     "$FREETYPE_SOURCE_DIR"
     "$FRIBIDI_SOURCE_DIR"
@@ -117,6 +118,7 @@ if [[ -z "$provided_source_root" ]]; then
     download_source "$X265_ARCHIVE" "$X265_URL" "$X265_SHA256"
     download_source "$OPUS_ARCHIVE" "$OPUS_URL" "$OPUS_SHA256"
     download_source "$SVT_AV1_ARCHIVE" "$SVT_AV1_URL" "$SVT_AV1_SHA256"
+    download_source "$DAV1D_ARCHIVE" "$DAV1D_URL" "$DAV1D_SHA256"
     download_source "$LIBASS_ARCHIVE" "$LIBASS_URL" "$LIBASS_SHA256"
     download_source "$FREETYPE_ARCHIVE" "$FREETYPE_URL" "$FREETYPE_SHA256"
     download_source "$FRIBIDI_ARCHIVE" "$FRIBIDI_URL" "$FRIBIDI_SHA256"
@@ -128,6 +130,7 @@ if [[ -z "$provided_source_root" ]]; then
     extract_source "$X265_ARCHIVE" "$X265_SOURCE_DIR"
     extract_source "$OPUS_ARCHIVE" "$OPUS_SOURCE_DIR"
     extract_source "$SVT_AV1_ARCHIVE" "$SVT_AV1_SOURCE_DIR"
+    extract_source "$DAV1D_ARCHIVE" "$DAV1D_SOURCE_DIR"
     extract_source "$LIBASS_ARCHIVE" "$LIBASS_SOURCE_DIR"
     extract_source "$FREETYPE_ARCHIVE" "$FREETYPE_SOURCE_DIR"
     extract_source "$FRIBIDI_ARCHIVE" "$FRIBIDI_SOURCE_DIR"
@@ -338,6 +341,50 @@ build_architecture() {
             touch "$stamp_dir/svt-av1-$SVT_AV1_VERSION"
         fi
 
+        if [[ ! -f "$stamp_dir/dav1d-$DAV1D_VERSION" ]]; then
+            local dav1d_build="$architecture_build_dir/dav1d"
+            local dav1d_cross_file="$architecture_build_dir/dav1d-cross-$architecture.ini"
+            local dav1d_cpu_family
+            case "$architecture" in
+                arm64) dav1d_cpu_family="aarch64" ;;
+                x86_64) dav1d_cpu_family="x86_64" ;;
+            esac
+            rm -rf "$dav1d_build"
+            {
+                print "[binaries]"
+                print "c = '$clang_path'"
+                print "ar = '$ar_path'"
+                print "strip = '$strip_path'"
+                print "pkg-config = 'pkg-config'"
+                print "nasm = 'nasm'"
+                print
+                print "[built-in options]"
+                print "c_args = ['-arch', '$architecture', '-isysroot', '$sdk_path', '-mmacosx-version-min=$deployment_target', '-O3', '-fPIC']"
+                print "c_link_args = ['-arch', '$architecture', '-isysroot', '$sdk_path', '-mmacosx-version-min=$deployment_target']"
+                print
+                print "[host_machine]"
+                print "system = 'darwin'"
+                print "cpu_family = '$dav1d_cpu_family'"
+                print "cpu = '$architecture'"
+                print "endian = 'little'"
+            } > "$dav1d_cross_file"
+            meson setup \
+                "$dav1d_build" \
+                "$source_root/$DAV1D_SOURCE_DIR" \
+                --cross-file "$dav1d_cross_file" \
+                --prefix "$prefix" \
+                --libdir lib \
+                --buildtype release \
+                --default-library static \
+                -Denable_tools=false \
+                -Denable_examples=false \
+                -Denable_tests=false \
+                -Denable_docs=false
+            meson compile -C "$dav1d_build" -j "$build_jobs"
+            meson install -C "$dav1d_build"
+            touch "$stamp_dir/dav1d-$DAV1D_VERSION"
+        fi
+
         if [[ ! -f "$stamp_dir/x264-$X264_REVISION" ]]; then
             local x264_build="$architecture_build_dir/x264"
             rm -rf "$x264_build"
@@ -439,7 +486,7 @@ build_architecture() {
             touch "$stamp_dir/x265-$X265_VERSION"
         fi
 
-        if [[ ! -f "$stamp_dir/ffmpeg-$FFMPEG_VERSION" ]]; then
+        if [[ ! -f "$stamp_dir/ffmpeg-$FFMPEG_VERSION-dav1d-$DAV1D_VERSION" ]]; then
             local ffmpeg_build="$architecture_build_dir/ffmpeg"
             rm -rf "$ffmpeg_build"
             mkdir -p "$ffmpeg_build"
@@ -476,13 +523,14 @@ build_architecture() {
                 --enable-avfoundation \
                 --enable-gpl \
                 --enable-libass \
+                --enable-libdav1d \
                 --enable-libopus \
                 --enable-libsvtav1 \
                 --enable-libx264 \
                 --enable-libx265
             make -j "$build_jobs"
             make install
-            touch "$stamp_dir/ffmpeg-$FFMPEG_VERSION"
+            touch "$stamp_dir/ffmpeg-$FFMPEG_VERSION-dav1d-$DAV1D_VERSION"
         fi
     )
 }
@@ -522,6 +570,8 @@ ditto "$source_root/$X265_SOURCE_DIR/COPYING" "$staging_root/licenses/x265-GPL-2
 ditto "$source_root/$OPUS_SOURCE_DIR/COPYING" "$staging_root/licenses/Opus-COPYING.txt"
 ditto "$source_root/$SVT_AV1_SOURCE_DIR/LICENSE.md" "$staging_root/licenses/SVT-AV1-BSD-3-Clause-Clear.txt"
 ditto "$source_root/$SVT_AV1_SOURCE_DIR/PATENTS.md" "$staging_root/licenses/SVT-AV1-PATENTS.md"
+ditto "$source_root/$DAV1D_SOURCE_DIR/COPYING" "$staging_root/licenses/dav1d-BSD-2-Clause.txt"
+ditto "$source_root/$DAV1D_SOURCE_DIR/doc/PATENTS" "$staging_root/licenses/dav1d-AV1-PATENTS.txt"
 ditto "$source_root/$LIBASS_SOURCE_DIR/COPYING" "$staging_root/licenses/libass-COPYING.txt"
 ditto "$source_root/$FREETYPE_SOURCE_DIR/LICENSE.TXT" "$staging_root/licenses/FreeType-LICENSE.txt"
 ditto "$source_root/$FREETYPE_SOURCE_DIR/docs/GPLv2.TXT" "$staging_root/licenses/FreeType-GPL-2.0.txt"
@@ -536,6 +586,7 @@ ditto "$source_root/$LIBUNIBREAK_SOURCE_DIR/LICENCE" "$staging_root/licenses/lib
     print "x265 $X265_VERSION"
     print "Opus $OPUS_VERSION"
     print "SVT-AV1 $SVT_AV1_VERSION"
+    print "dav1d $DAV1D_VERSION"
     print "libass $LIBASS_VERSION"
     print "FreeType $FREETYPE_VERSION"
     print "FriBidi $FRIBIDI_VERSION"
@@ -549,6 +600,7 @@ ditto "$source_root/$LIBUNIBREAK_SOURCE_DIR/LICENCE" "$staging_root/licenses/lib
 "$staging_root/bin/ffmpeg" -hide_banner -buildconf > "$staging_root/metadata/ffmpeg-buildconf.txt"
 "$staging_root/bin/ffmpeg" -hide_banner -L > "$staging_root/metadata/ffmpeg-license.txt"
 "$staging_root/bin/ffmpeg" -hide_banner -encoders > "$staging_root/metadata/ffmpeg-encoders.txt" 2>&1
+"$staging_root/bin/ffmpeg" -hide_banner -decoders > "$staging_root/metadata/ffmpeg-decoders.txt" 2>&1
 "$staging_root/bin/ffmpeg" -hide_banner -filters > "$staging_root/metadata/ffmpeg-filters.txt" 2>&1
 
 if ! grep -q -- '--enable-gpl' "$staging_root/metadata/ffmpeg-buildconf.txt" \
@@ -568,6 +620,11 @@ for required_encoder in libx264 libx265 libsvtav1 libopus h264_videotoolbox hevc
         exit 1
     fi
 done
+
+if ! grep -q " libdav1d " "$staging_root/metadata/ffmpeg-decoders.txt"; then
+    print -u2 "Bundled FFmpeg is missing decoder: libdav1d"
+    exit 1
+fi
 
 for required_filter in subtitles ass; do
     if ! grep -Eq "[[:space:]]${required_filter}[[:space:]]" "$staging_root/metadata/ffmpeg-filters.txt"; then

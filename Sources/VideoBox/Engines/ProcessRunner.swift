@@ -50,8 +50,18 @@ actor ProcessRunner: CLIProcessRunning {
             )
         }
 
-        process.waitUntilExit()
-        try Task.checkCancellation()
+        do {
+            while process.isRunning {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            try Task.checkCancellation()
+        } catch {
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            throw error
+        }
 
         try? stdoutHandle.synchronize()
         try? stderrHandle.synchronize()

@@ -6,7 +6,7 @@ The bundled media runtime is built from the unmodified upstream source trees in 
 
 - macOS 13 or later
 - Current Xcode Command Line Tools or Xcode
-- CMake, NASM, and pkg-config (`brew install cmake nasm pkgconf`)
+- CMake, Meson, Ninja, NASM, and pkg-config (`brew install cmake meson ninja nasm pkgconf`)
 
 ## Build
 
@@ -20,7 +20,7 @@ VIDEOBOX_FFMPEG_ARCHS="arm64" \
 
 In a VideoBox repository checkout, omit `VIDEOBOX_FFMPEG_SOURCE_ROOT`; the script downloads the pinned archives and verifies every SHA-256 checksum before extraction.
 
-The script verifies every source checksum, builds all non-system dependencies statically for Apple Silicon, creates native arm64 `ffmpeg` and `ffprobe` executables, performs smoke encodes with x264, 8/10-bit x265, SVT-AV1, Opus, and libass, and rejects every non-system runtime dependency.
+The script verifies every source checksum, builds all non-system dependencies statically for Apple Silicon, creates native arm64 `ffmpeg` and `ffprobe` executables, performs smoke encodes with x264, 8/10-bit x265, SVT-AV1, Opus, and libass, decodes an AV1 frame with dav1d, and rejects every non-system runtime dependency.
 
 The significant FFmpeg configuration choices are:
 
@@ -29,6 +29,7 @@ The significant FFmpeg configuration choices are:
 --enable-libx264
 --enable-libx265
 --enable-libsvtav1
+--enable-libdav1d
 --enable-libopus
 --enable-libass
 --enable-static

@@ -33,6 +33,7 @@ for source_directory in \
     "$X265_SOURCE_DIR" \
     "$OPUS_SOURCE_DIR" \
     "$SVT_AV1_SOURCE_DIR" \
+    "$DAV1D_SOURCE_DIR" \
     "$LIBASS_SOURCE_DIR" \
     "$FREETYPE_SOURCE_DIR" \
     "$FRIBIDI_SOURCE_DIR" \

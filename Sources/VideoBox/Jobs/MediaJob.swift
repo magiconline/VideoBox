@@ -3,9 +3,28 @@ import Foundation
 struct MediaJobRequest: Codable, Equatable, Sendable {
     let exportRequest: ExportRequest
 
-    var sourceURL: URL { exportRequest.sourceURL }
+    var sourceURL: URL {
+        if case let .trackExtraction(track) = exportRequest.operation {
+            return track.resolvedSourceURL(primarySourceURL: exportRequest.sourceURL)
+        }
+        return exportRequest.sourceURL
+    }
     var destinationURL: URL { exportRequest.destinationURL }
     var exportMode: ExportMode { exportRequest.configuration.mode }
+
+    var operationDisplayName: String {
+        switch exportRequest.operation {
+        case .media: exportMode.displayName
+        case .trackExtraction: "单轨导出"
+        }
+    }
+
+    var operationSymbolName: String {
+        switch exportRequest.operation {
+        case .media: "square.and.arrow.up"
+        case .trackExtraction: "rectangle.portrait.and.arrow.right"
+        }
+    }
 }
 
 struct MediaJob: Identifiable, Codable, Equatable, Sendable {

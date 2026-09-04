@@ -2,9 +2,10 @@ import AVKit
 import SwiftUI
 
 struct EditorView: View {
+    @EnvironmentObject private var environment: AppEnvironment
     let asset: MediaAsset
     let mediaProbe: MediaProbe?
-    let isProbing: Bool
+    let isLoadingVideo: Bool
     @ObservedObject var playerController: PlayerController
     @Binding var configuration: ExportConfiguration
     @Binding var editing: EditSettings
@@ -21,6 +22,10 @@ struct EditorView: View {
     @State private var isShowingTrackEditor = false
     @State private var isShowingLargePreview = false
     @State private var isExportInspectorVisible = true
+    @State private var trackPreviewSelection = TrackPreviewSelection()
+    @State private var trackPreviewStatus = TrackPreviewStatus.idle
+    @State private var previewGenerationID = UUID()
+    @State private var previewTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -50,7 +55,11 @@ struct EditorView: View {
         .sheet(isPresented: $isShowingTrackEditor) {
             MediaTrackEditorView(
                 mediaProbe: mediaProbe,
-                configuration: $configuration
+                primarySourceURL: asset.url,
+                configuration: $configuration,
+                previewSelection: $trackPreviewSelection,
+                previewStatus: trackPreviewStatus,
+                requestPreview: refreshTrackPreview
             )
         }
         .sheet(isPresented: $isShowingLargePreview) {
@@ -59,6 +68,70 @@ struct EditorView: View {
                 segment: editing.selectedClip,
                 duration: mediaProbe?.duration
             )
+        }
+        .onDisappear {
+            previewTask?.cancel()
+        }
+        .onChange(of: configuration.subtitles.timeOffsetSeconds) { _ in
+            guard playerController.isUsingTrackPreview,
+                  trackPreviewSelection.subtitleTrackID != nil else { return }
+            refreshTrackPreview(using: trackPreviewSelection)
+        }
+    }
+
+    private func showTrackEditor() {
+        trackPreviewSelection.normalize(using: configuration.trackSettings)
+        isShowingTrackEditor = true
+    }
+
+    private func refreshTrackPreview(using requestedSelection: TrackPreviewSelection) {
+        var selection = requestedSelection
+        selection.normalize(using: configuration.trackSettings)
+        trackPreviewSelection = selection
+        let selectedTracks = selection.selectedTracks(from: configuration.trackSettings)
+
+        previewTask?.cancel()
+        let generationID = UUID()
+        previewGenerationID = generationID
+        let shouldResume = playerController.isPlaying
+        trackPreviewStatus = .building
+
+        previewTask = Task { @MainActor in
+            do {
+                let previewAsset = try await environment.createTrackPreview(
+                    primarySourceURL: asset.url,
+                    tracks: selectedTracks,
+                    duration: mediaProbe?.duration,
+                    subtitleOffset: configuration.subtitles.timeOffsetSeconds
+                )
+                guard !Task.isCancelled, previewGenerationID == generationID else {
+                    try? FileManager.default.removeItem(at: previewAsset.mediaURL)
+                    if let subtitleURL = previewAsset.subtitleURL {
+                        try? FileManager.default.removeItem(at: subtitleURL)
+                    }
+                    return
+                }
+                do {
+                    try playerController.loadTrackPreview(
+                        mediaURL: previewAsset.mediaURL,
+                        subtitleURL: previewAsset.subtitleURL,
+                        preservingTime: true,
+                        resumesPlayback: shouldResume
+                    )
+                } catch {
+                    try? FileManager.default.removeItem(at: previewAsset.mediaURL)
+                    if let subtitleURL = previewAsset.subtitleURL {
+                        try? FileManager.default.removeItem(at: subtitleURL)
+                    }
+                    throw error
+                }
+                trackPreviewStatus = .ready
+            } catch is CancellationError {
+                return
+            } catch {
+                guard previewGenerationID == generationID else { return }
+                trackPreviewStatus = .failed("无法加载所选轨道，请检查轨道文件是否完整。")
+            }
         }
     }
 
@@ -92,10 +165,11 @@ struct EditorView: View {
             }
 
             Button {
-                isShowingTrackEditor = true
+                showTrackEditor()
             } label: {
                 Label("轨道与元数据", systemImage: "rectangle.stack")
             }
+            .disabled(isLoadingVideo)
 
             Button(action: showQueue) {
                 Label(
@@ -108,7 +182,7 @@ struct EditorView: View {
                 Label("导出", systemImage: "square.and.arrow.up")
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!canExport)
+            .disabled(!canExport || isLoadingVideo)
 
             Button {
                 isExportInspectorVisible.toggle()
@@ -133,41 +207,37 @@ struct EditorView: View {
             ZStack {
                 Color.black
 
-                EditedPlayerSurface(
-                    playerController: playerController,
-                    segment: editing.selectedClip,
-                    duration: mediaProbe?.duration
-                )
+                if isPreviewLoading {
+                    VideoLoadingProgress()
+                        .foregroundStyle(.white)
+                        .tint(.white)
+                        .transition(.opacity)
+                } else {
+                    EditedPlayerSurface(
+                        playerController: playerController,
+                        segment: editing.selectedClip,
+                        duration: mediaProbe?.duration
+                    )
 
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button {
-                            isShowingLargePreview = true
-                        } label: {
-                            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                .frame(width: 18, height: 18)
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Button {
+                                isShowingLargePreview = true
+                            } label: {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                    .frame(width: 18, height: 18)
+                            }
+                            .buttonStyle(.bordered)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 7))
+                            .help("在大窗口中预览")
                         }
-                        .buttonStyle(.bordered)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 7))
-                        .help("在大窗口中预览")
+                        Spacer()
                     }
-                    Spacer()
-                }
-                .padding(10)
-
-                if isProbing {
-                    VStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("正在读取媒体信息…")
-                            .font(.caption)
-                    }
-                    .foregroundStyle(.white)
-                    .padding(12)
-                    .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(10)
                 }
             }
+            .animation(.easeInOut(duration: 0.18), value: isPreviewLoading)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -192,7 +262,7 @@ struct EditorView: View {
 
     private var sourceSummary: String {
         guard let mediaProbe else {
-            return isProbing ? "正在分析…" : asset.url.deletingLastPathComponent().path
+            return asset.url.deletingLastPathComponent().path
         }
 
         var parts: [String] = []
@@ -224,11 +294,52 @@ struct EditorView: View {
             && !editing.clips.isEmpty
     }
 
+    private var isPreviewLoading: Bool {
+        isLoadingVideo || trackPreviewStatus.isBuilding
+    }
+
     private func formatBitRate(_ bitRate: Int64) -> String {
         if bitRate >= 1_000_000 {
             return "\((Double(bitRate) / 1_000_000).formatted(.number.precision(.fractionLength(1)))) Mbps"
         }
         return "\((Double(bitRate) / 1_000).formatted(.number.precision(.fractionLength(0)))) kbps"
+    }
+}
+
+struct VideoLoadingProgress: View {
+    var width: CGFloat = 240
+    @State private var isAnimating = false
+
+    var body: some View {
+        VStack(spacing: 9) {
+            Text("正在加载视频…")
+                .font(.caption.weight(.medium))
+
+            GeometryReader { proxy in
+                let segmentWidth = max(52, proxy.size.width * 0.34)
+
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.gray.opacity(0.34))
+
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: segmentWidth)
+                        .offset(x: isAnimating ? proxy.size.width - segmentWidth : 0)
+                }
+                .clipShape(Capsule())
+            }
+            .frame(width: width, height: 5)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("正在加载视频")
+        .accessibilityValue("加载中")
+        .accessibilityIdentifier("video-loading-progress")
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                isAnimating = true
+            }
+        }
     }
 }
 

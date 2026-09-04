@@ -155,4 +155,15 @@ enum MediaStreamKind: String, Codable, Equatable, Sendable {
     case attachment
     case data
     case unknown
+
+    var shortDisplayName: String {
+        switch self {
+        case .video: "视频"
+        case .audio: "音频"
+        case .subtitle: "字幕"
+        case .attachment: "附件"
+        case .data: "数据"
+        case .unknown: "轨道"
+        }
+    }
 }

@@ -43,6 +43,12 @@ done
     -frames:v 4 -threads 2 -c:v libsvtav1 -preset 11 -pix_fmt yuv420p \
     "$temporary_directory/av1.mkv"
 
+# Verifying the container is not enough: older Macs cannot use VideoToolbox for
+# AV1, so the bundled runtime must be able to decode a real frame in software.
+"$ffmpeg" -v error \
+    -c:v libdav1d -i "$temporary_directory/av1.mkv" \
+    -frames:v 1 -f null -
+
 "$ffmpeg" -v error \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
     -t 0.25 -threads 2 -c:a libopus \
@@ -59,4 +65,4 @@ for output in x264.mp4 x265.mp4 x265-10bit.mp4 av1.mkv opus.ogg; do
         -of default=noprint_wrappers=1:nokey=1 "$temporary_directory/$output" >/dev/null
 done
 
-print "Verified x264, x265 (8/10-bit), AV1, Opus, subtitle burn-in, and ffprobe"
+print "Verified x264, x265 (8/10-bit), AV1 encode/software decode, Opus, subtitle burn-in, and ffprobe"

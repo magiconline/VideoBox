@@ -31,6 +31,40 @@ struct EditedPlayerSurface: View {
         ZStack(alignment: .bottom) {
             transformedVideo
 
+            if let message = playerController.playbackErrorMessage {
+                VStack(spacing: 7) {
+                    Label("视频播放失败", systemImage: "exclamationmark.triangle.fill")
+                        .font(.headline)
+                    Text(message)
+                        .font(.caption)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.white.opacity(0.82))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
+                .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, 36)
+                .padding(.bottom, 46)
+                .allowsHitTesting(false)
+                .accessibilityLabel("播放失败：\(message)")
+            }
+
+            if !playerController.subtitleText.isEmpty {
+                Text(playerController.subtitleText)
+                    .font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.white)
+                    .shadow(color: .black, radius: 2, x: 0, y: 1)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(.black.opacity(0.68), in: RoundedRectangle(cornerRadius: 7))
+                    .padding(.horizontal, 36)
+                    .padding(.bottom, 58)
+                    .accessibilityLabel("预览字幕：\(playerController.subtitleText)")
+            }
+
             PlayerTransportBar(
                 playerController: playerController,
                 duration: duration

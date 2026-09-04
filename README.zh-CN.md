@@ -14,6 +14,8 @@ VideoBox 使用 SwiftUI 构建原生界面，以 AVFoundation 提供播放预览
 ## 主要功能
 
 - **无需重新压缩即可调整视频文件的轨道与封装**：通过码流复制选择、保留或移除视频、音频与字幕轨道，修改轨道标题、语言及默认状态，并在原始编码兼容的前提下重新封装为 MP4、MOV、MKV 或 WebM。视频和音频码流保持不变，速度快且无画质损失。
+- 在“轨道与元数据”中分别导入、单独导出及排序视频、音频和字幕轨道；导入轨道可来自独立媒体文件，并按界面顺序写入成片。
+- 导入后可立即在播放器中切换并播放外部视频/音频轨道，文本字幕会随播放头直接显示，无需先导出成片。
 - 拖放导入、AVPlayer 预览与媒体信息检查。
 - 带缩略图的时间线，以及分割、删除、复制、拖放重排和顺序拼接。
 - 每个片段可独立设置速度、旋转、水平/垂直镜像、音量与缩放。
@@ -38,7 +40,7 @@ VideoBox 使用 SwiftUI 构建原生界面，以 AVFoundation 提供播放预览
 Release 页面会同时提供 `.sha256` 文件，可用于校验下载：
 
 ```bash
-shasum -a 256 -c VideoBox-0.2.0-macOS-arm64.dmg.sha256
+shasum -a 256 -c VideoBox-0.2.1-macOS-arm64.dmg.sha256
 ```
 
 ## 从源码构建
@@ -55,7 +57,7 @@ swift test
 制作可分发 DMG 时，脚本还会从源码编译固定版本的 FFmpeg 运行时。请先安装仅用于构建的工具：
 
 ```bash
-brew install cmake nasm pkgconf
+brew install cmake meson ninja nasm pkgconf
 ```
 
 然后生成 Apple Silicon 原生、临时签名的 DMG：

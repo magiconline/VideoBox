@@ -47,7 +47,7 @@ private struct JobRow: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Image(systemName: "square.and.arrow.up")
+            Image(systemName: job.request.operationSymbolName)
                 .font(.title2)
                 .foregroundStyle(.blue)
                 .frame(width: 36)
@@ -56,7 +56,7 @@ private struct JobRow: View {
                 Text(job.request.sourceURL.lastPathComponent)
                     .font(.headline)
                     .lineLimit(1)
-                Text("\(job.request.exportMode.displayName) · \(job.request.destinationURL.lastPathComponent)")
+                Text("\(job.request.operationDisplayName) · \(job.request.destinationURL.lastPathComponent)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
