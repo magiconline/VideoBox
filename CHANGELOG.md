@@ -2,6 +2,10 @@
 
 All notable changes to VideoBox are documented here. / VideoBox 的重要变更记录在此处。
 
+## Unreleased / 未发布
+
+- Adopted the MIT License. / 项目采用 MIT License。
+
 ## [0.1.0] - 2026-09-04
 
 ### English

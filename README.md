@@ -103,3 +103,7 @@ Tests/VideoBoxTests/     Unit and integration tests
 VideoBox is useful today as a local preview, but it is not yet a polished consumer release. Planned release work includes English UI localization, bundling or guided installation of compatible media tools, Developer ID signing, notarization, and broader real-world media compatibility testing.
 
 Bug reports and focused pull requests are welcome through [GitHub Issues](https://github.com/magiconline/VideoBox/issues).
+
+## License
+
+VideoBox is released under the [MIT License](LICENSE). FFmpeg is a separate project with its own LGPL/GPL licensing terms and is not included in the current DMG.

@@ -103,3 +103,7 @@ Tests/VideoBoxTests/     单元测试与集成测试
 VideoBox 目前适合作为本地预览工具使用，还不是完整的消费级正式版本。后续发布工作包括英文界面本地化、内置兼容媒体工具或提供引导式安装、Developer ID 签名与公证，以及覆盖更多真实媒体文件的兼容性测试。
 
 欢迎通过 [GitHub Issues](https://github.com/magiconline/VideoBox/issues) 提交问题，也欢迎范围明确的 Pull Request。
+
+## 开源许可
+
+VideoBox 使用 [MIT License](LICENSE) 发布。FFmpeg 是采用独立 LGPL/GPL 条款的第三方项目，目前的 DMG 尚未包含 FFmpeg。
