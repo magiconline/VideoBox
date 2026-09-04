@@ -14,13 +14,13 @@ From the root of the corresponding-source archive, run:
 
 ```bash
 VIDEOBOX_FFMPEG_SOURCE_ROOT="$PWD/Sources" \
-VIDEOBOX_FFMPEG_ARCHS="arm64 x86_64" \
+VIDEOBOX_FFMPEG_ARCHS="arm64" \
 ./Scripts/build_ffmpeg_runtime.sh
 ```
 
 In a VideoBox repository checkout, omit `VIDEOBOX_FFMPEG_SOURCE_ROOT`; the script downloads the pinned archives and verifies every SHA-256 checksum before extraction.
 
-The script verifies every source checksum, builds all non-system dependencies statically for each architecture, creates universal `ffmpeg` and `ffprobe` executables, performs smoke encodes with x264, 8/10-bit x265, SVT-AV1, Opus, and libass, and rejects every non-system runtime dependency.
+The script verifies every source checksum, builds all non-system dependencies statically for Apple Silicon, creates native arm64 `ffmpeg` and `ffprobe` executables, performs smoke encodes with x264, 8/10-bit x265, SVT-AV1, Opus, and libass, and rejects every non-system runtime dependency.
 
 The significant FFmpeg configuration choices are:
 

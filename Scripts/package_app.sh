@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=${0:A:h}
 project_root=${script_dir:h}
 configuration=${1:-release}
-architecture_string=${VIDEOBOX_ARCHS:-"arm64 x86_64"}
+architecture_string=${VIDEOBOX_ARCHS:-"arm64"}
 architectures=(${=architecture_string})
 signing_identity=${VIDEOBOX_SIGNING_IDENTITY:--}
 runtime_root=${VIDEOBOX_FFMPEG_RUNTIME_DIR:-}
@@ -35,8 +35,13 @@ done
 cd "$project_root"
 
 if [[ -z "$runtime_root" ]]; then
-    "$script_dir/build_ffmpeg_runtime.sh"
-    runtime_root="${VIDEOBOX_FFMPEG_BUILD_ROOT:-$project_root/.build/ffmpeg-runtime}/universal"
+    if (( ${#architectures[@]} == 1 )); then
+        runtime_architecture_label=${architectures[1]}
+    else
+        runtime_architecture_label=universal
+    fi
+    VIDEOBOX_FFMPEG_ARCHS="${architectures[*]}" "$script_dir/build_ffmpeg_runtime.sh"
+    runtime_root="${VIDEOBOX_FFMPEG_BUILD_ROOT:-$project_root/.build/ffmpeg-runtime}/$runtime_architecture_label"
 fi
 
 swift build "${build_arguments[@]}"

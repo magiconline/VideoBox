@@ -27,19 +27,19 @@ VideoBox 使用 SwiftUI 构建原生界面，以 AVFoundation 提供播放预览
 ## 运行要求
 
 - macOS 13 Ventura 或更高版本。
-- Apple Silicon 或 Intel Mac。
+- Apple Silicon Mac。
 - 安装 DMG 后可直接使用，无需 Homebrew 或额外媒体工具。
 
 ## 安装预览版
 
-1. 从 [GitHub Releases](https://github.com/magiconline/VideoBox/releases) 下载最新的通用版 `.dmg`。
+1. 从 [GitHub Releases](https://github.com/magiconline/VideoBox/releases) 下载最新的 Apple Silicon 版 `.dmg`。
 2. 打开 DMG，将 **VideoBox** 拖入 **Applications（应用程序）**。
 3. 由于预览版尚未公证，如果 macOS 阻止首次启动，请按住 Control 点击应用，再选择“打开”。
 
 Release 页面会同时提供 `.sha256` 文件，可用于校验下载：
 
 ```bash
-shasum -a 256 -c VideoBox-2.0.0-macOS-universal.dmg.sha256
+shasum -a 256 -c VideoBox-0.2.0-macOS-arm64.dmg.sha256
 ```
 
 ## 从源码构建
@@ -59,7 +59,7 @@ swift test
 brew install cmake nasm pkgconf
 ```
 
-然后生成通用架构、临时签名的 App 与 DMG：
+然后生成 Apple Silicon 原生、临时签名的 App 与 DMG：
 
 ```bash
 ./Scripts/create_dmg.sh release

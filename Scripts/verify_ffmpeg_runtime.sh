@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir=${0:A:h}
 project_root=${script_dir:h}
-runtime_root=${VIDEOBOX_FFMPEG_RUNTIME_DIR:-${1:-"$project_root/.build/ffmpeg-runtime/universal"}}
+runtime_root=${VIDEOBOX_FFMPEG_RUNTIME_DIR:-${1:-"$project_root/.build/ffmpeg-runtime/arm64"}}
 ffmpeg="$runtime_root/bin/ffmpeg"
 ffprobe="$runtime_root/bin/ffprobe"
 temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/VideoBox-ffmpeg-smoke.XXXXXX")

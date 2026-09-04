@@ -27,19 +27,19 @@ VideoBox combines a SwiftUI interface and AVFoundation playback with a self-cont
 ## Requirements
 
 - macOS 13 Ventura or later.
-- Apple Silicon or Intel Mac.
+- Apple Silicon Mac.
 - No Homebrew installation or separate media tools are required for the DMG release.
 
 ## Install the preview
 
-1. Download the latest universal `.dmg` from [GitHub Releases](https://github.com/magiconline/VideoBox/releases).
+1. Download the latest Apple Silicon `.dmg` from [GitHub Releases](https://github.com/magiconline/VideoBox/releases).
 2. Open it and drag **VideoBox** to **Applications**.
 3. Because the preview is not notarized, Control-click the app and choose **Open** the first time if macOS blocks a normal launch.
 
 The release page includes a `.sha256` file so you can verify the download:
 
 ```bash
-shasum -a 256 -c VideoBox-2.0.0-macOS-universal.dmg.sha256
+shasum -a 256 -c VideoBox-0.2.0-macOS-arm64.dmg.sha256
 ```
 
 ## Build from source
@@ -59,7 +59,7 @@ Building the distributable DMG also compiles the pinned FFmpeg runtime from sour
 brew install cmake nasm pkgconf
 ```
 
-Then create a universal, ad-hoc-signed app and DMG:
+Then create an Apple Silicon, ad-hoc-signed app and DMG:
 
 ```bash
 ./Scripts/create_dmg.sh release

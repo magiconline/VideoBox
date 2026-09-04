@@ -12,6 +12,9 @@ jobs:
   release:
     runs-on: macos-15
     timeout-minutes: 120
+    env:
+      VIDEOBOX_ARCHS: arm64
+      VIDEOBOX_FFMPEG_ARCHS: arm64
 
     steps:
       - name: Check out source
@@ -39,7 +42,7 @@ jobs:
       - name: Test
         run: swift test
 
-      - name: Build and verify universal DMG
+      - name: Build and verify arm64 DMG
         run: ./Scripts/create_dmg.sh release
 
       - name: Package corresponding FFmpeg source

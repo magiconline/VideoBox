@@ -6,7 +6,7 @@ project_root=${script_dir:h}
 source "$script_dir/ffmpeg_versions.sh"
 
 build_root=${VIDEOBOX_FFMPEG_BUILD_ROOT:-"$project_root/.build/ffmpeg-runtime"}
-architecture_string=${VIDEOBOX_FFMPEG_ARCHS:-${VIDEOBOX_ARCHS:-"arm64 x86_64"}}
+architecture_string=${VIDEOBOX_FFMPEG_ARCHS:-${VIDEOBOX_ARCHS:-"arm64"}}
 architectures=(${=architecture_string})
 deployment_target=${VIDEOBOX_DEPLOYMENT_TARGET:-13.0}
 build_jobs=${VIDEOBOX_BUILD_JOBS:-$(sysctl -n hw.logicalcpu)}
@@ -22,7 +22,6 @@ else
 fi
 build_dir="$build_root/build"
 prefix_root="$build_root/prefix"
-runtime_root="$build_root/universal"
 
 if (( ${#architectures[@]} == 0 )); then
     print -u2 "VIDEOBOX_FFMPEG_ARCHS must contain at least one architecture"
@@ -38,6 +37,13 @@ for architecture in "${architectures[@]}"; do
             ;;
     esac
 done
+
+if (( ${#architectures[@]} == 1 )); then
+    runtime_architecture_label=${architectures[1]}
+else
+    runtime_architecture_label=universal
+fi
+runtime_root="$build_root/$runtime_architecture_label"
 
 for required_tool in curl shasum tar make cmake nasm pkg-config xcrun lipo libtool otool; do
     if ! command -v "$required_tool" >/dev/null 2>&1; then
