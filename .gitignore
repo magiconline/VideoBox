@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+dist/
+work/
+*.xcuserstate
+xcuserdata/
+*.dmg
+*.dmg.sha256

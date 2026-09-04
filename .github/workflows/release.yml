@@ -1,0 +1,65 @@
+name: Release DMG
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify tag and app versions match
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          app_version="$(plutil -extract CFBundleShortVersionString raw Packaging/Info.plist)"
+          if [[ "$tag_version" != "$app_version" ]]; then
+            echo "Tag version $tag_version does not match app version $app_version" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: swift test
+
+      - name: Build and verify universal DMG
+        run: ./Scripts/create_dmg.sh release
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          artifacts=(dist/*.dmg dist/*.dmg.sha256)
+          notes_path="Documentation/Releases/${GITHUB_REF_NAME}.md"
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${artifacts[@]}" --clobber
+            exit 0
+          fi
+
+          release_arguments=(
+            "$GITHUB_REF_NAME"
+            "${artifacts[@]}"
+            --title "VideoBox $GITHUB_REF_NAME"
+          )
+
+          if [[ -f "$notes_path" ]]; then
+            release_arguments+=(--notes-file "$notes_path")
+          else
+            release_arguments+=(--generate-notes)
+          fi
+
+          if [[ "$GITHUB_REF_NAME" == v0.* ]]; then
+            release_arguments+=(--prerelease)
+          fi
+
+          gh release create "${release_arguments[@]}"
