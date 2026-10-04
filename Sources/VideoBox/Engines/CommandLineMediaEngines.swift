@@ -19,6 +19,8 @@ actor FFprobeEngine: MediaProbing {
                     "-show_format",
                     "-show_streams",
                     "-show_chapters",
+                    "-show_frames", "-read_intervals", "%+#32",
+                    "-show_entries", "frame=stream_index:frame_side_data",
                     sourceURL.path
                 ]
             )
@@ -34,7 +36,9 @@ actor FFprobeEngine: MediaProbing {
 
         do {
             let payload = try JSONDecoder().decode(FFprobePayload.self, from: Data(result.standardOutput.utf8))
-            return payload.mediaProbe(sourceURL: sourceURL)
+            var probe = payload.mediaProbe(sourceURL: sourceURL)
+            probe.rawReport = result.standardOutput
+            return probe
         } catch {
             throw MediaEngineError.invalidProbeOutput(error)
         }
@@ -58,18 +62,134 @@ actor FFmpegExportEngine: MediaExporting {
 
     @discardableResult
     func export(_ request: ExportRequest) async throws -> URL {
+        try await export(request, onProgress: nil)
+    }
+
+    @discardableResult
+    func export(_ originalRequest: ExportRequest, onProgress: (@Sendable (Double) -> Void)?) async throws -> URL {
+        var request = originalRequest
+        let destinationBlockers = ExportPlan.destinationBlockers(request: request)
+        if !destinationBlockers.isEmpty { throw ExportValidationError(blockers: destinationBlockers) }
+        if case .media = request.operation {
+            if request.configuration.mode == .streamCopy, request.editing.simpleTrimRange() != nil {
+                let video = request.configuration.trackSettings.first { $0.isIncluded && $0.kind == .video }
+                request.configuration.copyTrimIndex = try await QuickTrimIndex.scan(
+                    url: video?.resolvedSourceURL(primarySourceURL: request.sourceURL) ?? request.sourceURL,
+                    streamIndex: video?.streamIndex ?? request.sourceVideo?.index ?? 0,
+                    duration: request.editing.sourceDuration,
+                    ffprobe: executableURL.deletingLastPathComponent().appendingPathComponent("ffprobe"), runner: runner)
+            }
+            try ExportPlan(request: request).validate()
+            let fileBlockers = ExportPlan.fileBlockers(configuration: request.configuration, primarySourceURL: request.sourceURL)
+                + request.editing.referencedURLs.filter { !FileManager.default.isReadableFile(atPath: $0.path) }.map { "素材已不可用：\($0.lastPathComponent)" }
+            if !fileBlockers.isEmpty { throw ExportValidationError(blockers: fileBlockers) }
+        }
         if !request.configuration.advanced.overwriteExisting {
             try ensureDestinationDoesNotExist(request.destinationURL)
         }
-
+        // Never write over a prior export until a complete, verified replacement is ready.
+        let temporaryURL = request.destinationURL.deletingLastPathComponent()
+            .appendingPathComponent(".VideoBox-\(UUID().uuidString)")
+            .appendingPathExtension(request.destinationURL.pathExtension)
+        var workingRequest = request
+        workingRequest.destinationURL = temporaryURL
+        workingRequest.configuration.advanced.overwriteExisting = false
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let assetDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("VideoBox-export-assets-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: assetDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: assetDirectory) }
+        let prepared = try await ExportPreparedAssets.make(request: request, directory: assetDirectory, ffmpeg: executableURL, runner: runner)
+        let duration: TimeInterval?
+        if case let .trackExtraction(track) = request.operation {
+            duration = track.sourceDuration ?? request.sourceDuration
+        } else {
+            duration = request.editing.trimmedDuration ?? request.sourceDuration
+        }
+        let progressParser = FFmpegProgressParser(duration: duration)
         let result = try await runner.run(
-            CLICommand(
-                executableURL: executableURL,
-                arguments: commandBuilder.arguments(for: request)
-            )
+            CLICommand(executableURL: executableURL, arguments: commandBuilder.arguments(for: workingRequest, prepared: prepared)),
+            onStandardOutput: { chunk in
+                if let progress = progressParser.consume(chunk) { onProgress?(progress) }
+            }
         )
         try validate(result, tool: "FFmpeg")
+        try Task.checkCancellation()
+        try await validateEncodedVideo(at: temporaryURL, request: request)
+        try await validateDynamicHDRCopy(at: temporaryURL, request: request)
+        try Task.checkCancellation()
+        // Recheck immediately before replacing in case a source alias appeared while encoding.
+        let finalDestinationBlockers = ExportPlan.destinationBlockers(request: request)
+        if !finalDestinationBlockers.isEmpty { throw ExportValidationError(blockers: finalDestinationBlockers) }
+        if request.configuration.advanced.overwriteExisting,
+           FileManager.default.fileExists(atPath: request.destinationURL.path) {
+            _ = try FileManager.default.replaceItemAt(request.destinationURL, withItemAt: temporaryURL)
+        } else {
+            try FileManager.default.moveItem(at: temporaryURL, to: request.destinationURL)
+        }
         return request.destinationURL
+    }
+
+    private func validateEncodedVideo(at url: URL, request: ExportRequest) async throws {
+        guard case .media = request.operation, request.configuration.mode == .transcode else { return }
+        let ffprobeURL = executableURL.deletingLastPathComponent().appendingPathComponent("ffprobe")
+        guard FileManager.default.isExecutableFile(atPath: ffprobeURL.path) else {
+            throw ExportValidationError(blockers: ["找不到随包 ffprobe，无法核对实际导出位深与色度采样"])
+        }
+        let probe = try await FFprobeEngine(executableURL: ffprobeURL, runner: runner).probe(url)
+        let videoStreams = probe.streams.filter { $0.kind == .video && !$0.isAttachedPicture }
+        let plan = ExportPlan(request: request)
+        let sourceVideo = request.configuration.trackSettings.first { $0.isIncluded && $0.kind == .video }?.sourceStream ?? request.sourceVideo
+        let colorPlan = ColorConversionPlan(settings: request.configuration.color, source: sourceVideo)
+        guard !videoStreams.isEmpty else { throw ExportValidationError(blockers: ["导出结果缺少视频轨道"]) }
+        for stream in videoStreams {
+            guard stream.codecName == request.configuration.video.codec.mediaCodecName,
+                  let depth = stream.bitDepth, depth >= (plan.pixelFormat.bitDepth ?? 8),
+                  stream.chromaSubsampling == plan.pixelFormat.chromaSubsampling else {
+                throw ExportValidationError(blockers: [
+                    "编码器实际输出 \(stream.codecName ?? "未知") / \(stream.bitDepth.map { "\($0)-bit" } ?? "未知位深") / \(stream.chromaSubsampling?.displayName ?? "未知采样")，与请求的 \(plan.pixelFormat.displayName) 不符；未替换目标文件"
+                ])
+            }
+            if colorPlan.needsConversion, let expected = colorPlan.output {
+                guard stream.colorPrimaries == expected.primaries, stream.colorTransfer == expected.transfer,
+                      stream.colorSpace == expected.matrix, VideoColorSpec.range(stream.colorRange) == expected.range else {
+                    throw ExportValidationError(blockers: ["实际导出的色彩标签或范围与转换目标不符，未替换目标文件"])
+                }
+            }
+            if (colorPlan.needsConversion || request.configuration.color.discardsDynamicHDR) && stream.hasDynamicHDR {
+                throw ExportValidationError(blockers: ["转换结果残留了动态 HDR 标记，未替换目标文件"])
+            }
+        }
+    }
+
+    private func validateDynamicHDRCopy(at url: URL, request: ExportRequest) async throws {
+        guard case .media = request.operation, request.configuration.mode == .streamCopy else { return }
+        var videos = request.configuration.trackSettings.filter { $0.isIncluded && $0.kind == .video }
+        if videos.isEmpty, let source = request.sourceVideo {
+            videos = [TrackExportSettings(sourceURL: request.sourceURL, stream: source, sourceDuration: request.sourceDuration)]
+        }
+        guard videos.contains(where: { $0.sourceStream?.hasDynamicHDR == true }) else { return }
+        let probe = try await FFprobeEngine(executableURL: executableURL.deletingLastPathComponent().appendingPathComponent("ffprobe"), runner: runner).probe(url)
+        let outputs = probe.streams.filter { $0.kind == .video }
+        for (position, track) in videos.enumerated() where track.sourceStream?.hasDynamicHDR == true {
+            guard outputs.indices.contains(position), outputs[position].hdrDescription == track.sourceStream?.hdrDescription,
+                  outputs[position].dolbyVisionProfile == track.sourceStream?.dolbyVisionProfile,
+                  outputs[position].dolbyVisionCompatibilityID == track.sourceStream?.dolbyVisionCompatibilityID else {
+                throw ExportValidationError(blockers: ["目标容器没有完整保留动态 HDR 标记，请保持原容器；未替换目标文件"])
+            }
+            let before = try await videoPacketHash(url: track.resolvedSourceURL(primarySourceURL: request.sourceURL), stream: track.streamIndex)
+            let after = try await videoPacketHash(url: url, stream: outputs[position].index)
+            guard before == after else { throw ExportValidationError(blockers: ["动态 HDR 视频包的完整性核对未通过，请保持源容器；未替换目标文件"]) }
+        }
+    }
+
+    private func videoPacketHash(url: URL, stream: Int) async throws -> String {
+        let result = try await runner.run(CLICommand(executableURL: executableURL,
+            arguments: ["-v", "error", "-nostdin", "-i", url.path, "-map", "0:\(stream)", "-c", "copy", "-f", "streamhash", "-hash", "sha256", "-"]))
+        try validate(result, tool: "动态 HDR 完整性核对")
+        guard let hash = result.standardOutput.split(separator: "\n").first(where: { $0.contains("SHA256=") }) else {
+            throw ExportValidationError(blockers: ["无法读取动态 HDR 视频包校验值"])
+        }
+        return String(hash.split(separator: "=").last ?? "")
     }
 }
 
@@ -165,35 +285,41 @@ actor FFmpegTrackPreviewEngine {
 }
 
 struct FFmpegCommandBuilder: Sendable {
-    func arguments(for request: ExportRequest) -> [String] {
+    func arguments(for request: ExportRequest, prepared: ExportPreparedAssets = ExportPreparedAssets()) -> [String] {
         if case let .trackExtraction(track) = request.operation {
             return trackExtractionArguments(for: request, track: track)
         }
 
         let configuration = request.configuration
         let editing = request.editing
-        let usesComposition = editing.requiresFilterComposition
-        let effectiveMode: ExportMode = usesComposition ? .transcode : configuration.mode
+        let effectiveMode = configuration.mode
+        let usesComposition = effectiveMode == .transcode && (editing.requiresFilterComposition || editing.simpleTrimRange() != nil)
         let simpleTrimRange = editing.simpleTrimRange()
         let usesOffsetSubtitleInput = abs(configuration.subtitles.timeOffsetSeconds) > 0.000_1
             && configuration.subtitles.mode != .remove
             && configuration.subtitles.mode != .burn
             && !usesComposition
+            && prepared.subtitleURLs == nil
         let inputPlan = FFmpegInputPlan(
             primarySourceURL: request.sourceURL,
             tracks: configuration.trackSettings.filter { track in
                 guard track.isIncluded else { return false }
+                if track.kind == .audio, configuration.audio.codec == .none { return false }
+                if track.kind == .attachment, !configuration.includeAttachments { return false }
+                if track.kind == .data, !configuration.includeDataStreams { return false }
                 return track.kind != .subtitle
                     || (configuration.subtitles.mode != .remove
                         && configuration.subtitles.mode != .burn
-                        && !usesComposition)
+                        && !usesComposition && prepared.subtitleURLs == nil)
             },
             subtitleOffset: usesOffsetSubtitleInput ? configuration.subtitles.timeOffsetSeconds : nil,
-            includeFallbackSubtitleInput: configuration.trackSettings.isEmpty && usesOffsetSubtitleInput
+            includeFallbackSubtitleInput: configuration.trackSettings.isEmpty && usesOffsetSubtitleInput,
+            additionalURLs: editing.referencedURLs
         )
         var arguments = [
             "-hide_banner",
             "-nostdin",
+            "-progress", "pipe:1", "-nostats",
             configuration.advanced.overwriteExisting ? "-y" : "-n"
         ]
 
@@ -203,6 +329,10 @@ struct FFmpegCommandBuilder: Sendable {
 
         let inputSeek = effectiveMode == .streamCopy ? simpleTrimRange?.start : nil
         arguments += inputPlan.arguments(inputSeek: inputSeek)
+        let subtitleStartIndex = inputPlan.entries.count
+        for url in prepared.subtitleURLs ?? [] { arguments += ["-i", url.path] }
+        let chapterIndex = inputPlan.entries.count + (prepared.subtitleURLs?.count ?? 0)
+        if let url = prepared.chapterURL { arguments += ["-f", "ffmetadata", "-i", url.path] }
 
         if effectiveMode == .transcode,
            !usesComposition,
@@ -215,41 +345,57 @@ struct FFmpegCommandBuilder: Sendable {
         }
 
         if usesComposition {
-            arguments += compositionArguments(for: request, inputPlan: inputPlan)
+            arguments += compositionArguments(for: request, inputPlan: inputPlan, prepared: prepared)
         } else {
+            var mappingConfiguration = configuration
+            if prepared.subtitleURLs != nil { mappingConfiguration.subtitles.mode = .remove }
             arguments += mappingArguments(
-                configuration: configuration,
+                configuration: mappingConfiguration,
                 inputPlan: inputPlan,
                 usesOffsetSubtitleInput: usesOffsetSubtitleInput
             )
+        }
+        for index in (prepared.subtitleURLs ?? []).indices {
+            arguments += ["-map", "\(subtitleStartIndex + index):s:0"]
         }
 
         switch effectiveMode {
         case .streamCopy:
             arguments += ["-c", "copy"]
+            if configuration.audio.codec == .none { arguments.append("-an") }
             arguments += subtitleArguments(
                 configuration: configuration,
-                usesComposition: usesComposition
+                usesComposition: usesComposition,
+                hasPreparedSubtitles: prepared.subtitleURLs != nil
             )
         case .transcode:
-            arguments += videoArguments(for: request, includesSimpleFilters: !usesComposition)
+            arguments += videoArguments(for: request, includesSimpleFilters: !usesComposition, prepared: prepared)
             arguments += audioArguments(for: request, includesSimpleFilters: !usesComposition)
             arguments += subtitleArguments(
                 configuration: configuration,
-                usesComposition: usesComposition
+                usesComposition: usesComposition,
+                hasPreparedSubtitles: prepared.subtitleURLs != nil
             )
         }
 
-        arguments += containerArguments(configuration: configuration)
+        if let range = request.previewOutputRange {
+            arguments += ["-ss", decimal(range.start), "-t", decimal(range.duration)]
+        }
+        arguments += containerArguments(configuration: configuration, changesSourceTiming: editing.changesSourceTimingForExport)
+        if prepared.chapterURL != nil { arguments += ["-map_chapters", String(chapterIndex)] }
         arguments += playbackTagArguments(
             configuration: configuration,
             effectiveMode: effectiveMode
         )
         arguments += trackMetadataArguments(
             configuration: configuration,
-            usesComposition: usesComposition
+            usesComposition: usesComposition,
+            hasPreparedSubtitles: prepared.subtitleURLs != nil
         )
         arguments += metadataArguments(configuration: configuration)
+        if effectiveMode == .transcode {
+            arguments += colorPlan(for: request).outputArguments
+        }
 
         if !usesComposition,
            simpleTrimRange == nil,
@@ -353,6 +499,13 @@ struct FFmpegCommandBuilder: Sendable {
         forceCompatibilityTranscode: Bool
     ) -> [String] {
         guard let track else { return ["-vn"] }
+        let nativeCodecs = Set(["h264", "hevc", "h265", "mpeg4", "prores", "mjpeg"])
+        if (forceCompatibilityTranscode || !nativeCodecs.contains(track.codecName?.lowercased() ?? "")),
+           (track.sourceStream?.bitDepth ?? 8) > 8 {
+            return ["-c:v", "hevc_videotoolbox", "-allow_sw", "1", "-profile:v", "main10",
+                    "-b:v", "16000k", "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,format=p010le",
+                    "-pix_fmt", "p010le", "-tag:v", "hvc1"]
+        }
         if forceCompatibilityTranscode {
             return [
                 "-c:v", "h264_videotoolbox",
@@ -407,6 +560,7 @@ struct FFmpegCommandBuilder: Sendable {
         var result = [
             "-hide_banner",
             "-nostdin",
+            "-progress", "pipe:1", "-nostats",
             request.configuration.advanced.overwriteExisting ? "-y" : "-n",
             "-i", sourceURL.path,
             "-map", "0:\(track.streamIndex)",
@@ -466,6 +620,8 @@ struct FFmpegCommandBuilder: Sendable {
             let includedTracks = configuration.trackSettings
                 .filter { track in
                     guard track.isIncluded else { return false }
+                    if track.kind == .audio, configuration.audio.codec == .none { return false }
+                    if track.kind == .attachment || track.kind == .data { return false }
                     if track.kind == .subtitle {
                         return configuration.subtitles.mode != .remove
                             && configuration.subtitles.mode != .burn
@@ -477,12 +633,7 @@ struct FFmpegCommandBuilder: Sendable {
                 let inputIndex = inputPlan.inputIndex(for: track)
                 result += ["-map", "\(inputIndex):\(track.streamIndex)?"]
             }
-            if configuration.includeAttachments {
-                result += ["-map", "0:t?"]
-            }
-            if configuration.includeDataStreams {
-                result += ["-map", "0:d?"]
-            }
+            result += auxiliaryMappingArguments(configuration: configuration, inputPlan: inputPlan)
         } else if usesOffsetSubtitleInput {
             let subtitleInputIndex = inputPlan.fallbackSubtitleInputIndex ?? 1
             result += [
@@ -516,10 +667,28 @@ struct FFmpegCommandBuilder: Sendable {
         return result
     }
 
+    private func auxiliaryMappingArguments(configuration: ExportConfiguration, inputPlan: FFmpegInputPlan) -> [String] {
+        var result: [String] = []
+        for (kind, enabled, specifier) in [(MediaStreamKind.attachment, configuration.includeAttachments, "t"),
+                                            (.data, configuration.includeDataStreams, "d")] where enabled {
+            let tracks = configuration.trackSettings.filter { $0.kind == kind }
+            if tracks.isEmpty {
+                result += ["-map", "0:\(specifier)?"]
+            } else {
+                for track in tracks where track.isIncluded {
+                    result += ["-map", "\(inputPlan.inputIndex(for: track)):\(track.streamIndex)?"]
+                }
+            }
+        }
+        return result
+    }
+
     private func compositionArguments(
         for request: ExportRequest,
-        inputPlan: FFmpegInputPlan
+        inputPlan: FFmpegInputPlan,
+        prepared: ExportPreparedAssets
     ) -> [String] {
+        if request.editing.requiresRenderedPreview { return advancedCompositionArguments(for: request, inputPlan: inputPlan, prepared: prepared) }
         let clips = request.editing.clips
         guard !clips.isEmpty else { return [] }
 
@@ -542,7 +711,8 @@ struct FFmpegCommandBuilder: Sendable {
             let chain = clipVideoFilters(
                 clip,
                 request: request,
-                canvas: canvas
+                canvas: canvas,
+                prepared: prepared
             )
             graph.append("\(videoSources[index])\(chain.joined(separator: ","))[vclip\(index)]")
         }
@@ -578,9 +748,11 @@ struct FFmpegCommandBuilder: Sendable {
         let audioConcatOutputs = audioInputs.indices.map {
             normalizeAudio ? "[aconcat\($0)]" : "[aout\($0)]"
         }.joined()
-        graph.append(
-            "\(concatInputs)concat=n=\(clipCount):v=1:a=\(audioInputs.count)[vout]\(audioConcatOutputs)"
-        )
+        let concatVideo = prepared.burnSubtitleURL == nil ? "vout" : "vconcat"
+        graph.append("\(concatInputs)concat=n=\(clipCount):v=1:a=\(audioInputs.count)[\(concatVideo)]\(audioConcatOutputs)")
+        if let burnURL = prepared.burnSubtitleURL {
+            graph.append("[vconcat]subtitles=filename='\(escapeFilterPath(burnURL.path))'[vout]")
+        }
 
         if normalizeAudio {
             for audioIndex in audioInputs.indices {
@@ -594,14 +766,120 @@ struct FFmpegCommandBuilder: Sendable {
         for audioIndex in audioInputs.indices {
             result += ["-map", "[aout\(audioIndex)]"]
         }
-        if configuration.includeAttachments {
-            result += ["-map", "0:t?"]
-        }
-        if configuration.includeDataStreams {
-            result += ["-map", "0:d?"]
-        } else {
+        result += auxiliaryMappingArguments(configuration: configuration, inputPlan: inputPlan)
+        if !configuration.includeDataStreams {
             result.append("-dn")
         }
+        return result
+    }
+
+    private func advancedCompositionArguments(for request: ExportRequest, inputPlan: FFmpegInputPlan, prepared: ExportPreparedAssets) -> [String] {
+        let edit = request.editing, config = request.configuration, clips = edit.clips
+        guard !clips.isEmpty, let canvas = compositionCanvasDimensions(for: request) else { return [] }
+        let fps = edit.compositionFrameRate(configuration: config, source: request.sourceVideo)
+        let primaryVideo = selectedVideoInput(configuration: config, inputPlan: inputPlan)
+        let primaryAudio = selectedAudioInputs(configuration: config, inputPlan: inputPlan)
+        let audibleLayers = edit.overlayClips.filter { $0.audioGain > 0 && !$0.media.audio.isEmpty }
+        let hasExtraAudio = clips.contains { !($0.media?.audio ?? []).isEmpty } || !audibleLayers.isEmpty
+        let audioCount = config.audio.codec == .none ? 0 : max(primaryAudio.count, hasExtraAudio ? 1 : 0)
+        var graph: [String] = []
+        var connections: [(input: String, output: String, audio: Bool)] = []
+        for (i, clip) in clips.enumerated() {
+            let input = clip.sourceURL.map { "[\(inputPlan.inputIndex(for: $0)):\(clip.media?.video?.index ?? 0)]" } ?? primaryVideo
+            connections.append((input, "[vs\(i)]", false))
+            for a in 0..<audioCount {
+                let audio: String?
+                if let source = clip.sourceURL {
+                    let tracks = clip.media?.audio ?? []
+                    audio = tracks.indices.contains(a) ? "[\(inputPlan.inputIndex(for: source)):\(tracks[a].index)]" : nil
+                } else { audio = primaryAudio.indices.contains(a) ? primaryAudio[a] : nil }
+                if let audio { connections.append((audio, "[as\(a)_\(i)]", true)) }
+                else { graph.append("anullsrc=r=48000:cl=stereo,atrim=duration=\(decimal(clip.sourceRange.end))[as\(a)_\(i)]") }
+            }
+        }
+        for (i, layer) in edit.overlayClips.enumerated() {
+            let input = inputPlan.inputIndex(for: layer.sourceURL)
+            if let video = layer.media.video { connections.append(("[\(input):\(video.index)]", "[ls\(i)]", false)) }
+            if audioCount > 0, layer.audioGain > 0, let audio = layer.media.audio.first { connections.append(("[\(input):\(audio.index)]", "[las\(i)]", true)) }
+        }
+        let groups = Dictionary(grouping: connections, by: \.input)
+        for input in groups.keys.sorted() {
+            let group = groups[input]!
+            graph.append(input + (group.count > 1 ? "\(group[0].audio ? "asplit" : "split")=\(group.count)" : (group[0].audio ? "anull" : "null")) + group.map(\.output).joined())
+        }
+        for (i, clip) in clips.enumerated() {
+            var filters = clipVideoFilters(clip, request: request, canvas: canvas, prepared: prepared)
+            filters += ["fps=\(decimal(fps))", "format=yuv444p16le", "settb=AVTB", "setpts=PTS-STARTPTS"]
+            if let frames = clip.keyframes, !frames.isEmpty {
+                let z = VisualKeyframe.expression(frames, key: \.scale, variable: "on/\(decimal(fps))")
+                let x = VisualKeyframe.expression(frames, key: \.x, variable: "on/\(decimal(fps))")
+                let y = VisualKeyframe.expression(frames, key: \.y, variable: "on/\(decimal(fps))")
+                filters.append("zoompan=z='\(z)':x='max(0,min(iw-iw/zoom,iw*(\(x))-iw/zoom/2))':y='max(0,min(ih-ih/zoom,ih*(\(y))-ih/zoom/2))':d=1:s=\(canvas.width)x\(canvas.height):fps=\(decimal(fps))")
+                let alpha = VisualKeyframe.expression(frames, key: \.opacity, variable: "T")
+                filters += ["format=gbrp16le", "geq=r='r(X,Y)*(\(alpha))':g='g(X,Y)*(\(alpha))':b='b(X,Y)*(\(alpha))'", "format=yuv444p16le", "settb=AVTB"]
+            }
+            // Ensure all cuts have their declared length, including short or empty audio streams.
+            filters += ["tpad=stop_mode=clone:stop_duration=1", "trim=duration=\(decimal(clip.outputDuration))"]
+            graph.append("[vs\(i)]" + filters.joined(separator: ",") + "[vc\(i)]")
+            for a in 0..<audioCount {
+                let filters = clipAudioFilters(clip) + ["aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=stereo", "apad", "atrim=duration=\(decimal(clip.outputDuration))", "asetpts=PTS-STARTPTS"]
+                graph.append("[as\(a)_\(i)]" + filters.joined(separator: ",") + "[ac\(a)_\(i)]")
+            }
+        }
+        var video = "[vc0]", audio = (0..<audioCount).map { "[ac\($0)_0]" }
+        var duration = clips[0].outputDuration
+        for i in clips.indices.dropFirst() {
+            let overlap = edit.transitionDuration(at: i), nextVideo = "[joinedv\(i)]"
+            if overlap > 0 {
+                graph.append("\(video)[vc\(i)]xfade=transition=\(clips[i].transition?.style ?? "fade"):duration=\(decimal(overlap)):offset=\(decimal(duration - overlap))\(nextVideo)")
+            } else { graph.append("\(video)[vc\(i)]concat=n=2:v=1:a=0,settb=AVTB\(nextVideo)") }
+            video = nextVideo
+            for a in 0..<audioCount {
+                let next = "[joineda\(a)_\(i)]"
+                graph.append("\(audio[a])[ac\(a)_\(i)]" + (overlap > 0 ? "acrossfade=d=\(decimal(overlap)):c1=tri:c2=tri" : "concat=n=2:v=0:a=1") + next)
+                audio[a] = next
+            }
+            duration += clips[i].outputDuration - overlap
+        }
+        for (i, layer) in edit.overlayClips.enumerated() {
+            let start = decimal(layer.startTime), end = decimal(min(edit.outputDuration, layer.startTime + layer.sourceRange.duration))
+            if let stream = layer.media.video {
+                var layerRequest = request; layerRequest.sourceVideo = stream
+                layerRequest.configuration.trackSettings = []
+                let color = colorPlan(for: layerRequest).filters(lutFilters: prepared.lutFilters)
+                let width = max(2, Int(Double(canvas.width) * layer.pose.scale) / 2 * 2)
+                var filters = ["trim=start=\(decimal(layer.sourceRange.start)):duration=\(decimal(layer.sourceRange.duration))", "setpts=PTS-STARTPTS"] + color
+                filters += ["scale=\(width):-2", "setsar=1", "format=gbrap16le"]
+                if layer.keyframes.isEmpty { filters.append("colorchannelmixer=aa=\(decimal(layer.pose.opacity))") }
+                else {
+                    let alpha = VisualKeyframe.expression(layer.keyframes, key: \.opacity, variable: "T")
+                    filters.append("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*(\(alpha))'")
+                }
+                filters.append("setpts=PTS+\(start)/TB")
+                graph.append("[ls\(i)]" + filters.joined(separator: ",") + "[lv\(i)]")
+                let x = layer.keyframes.isEmpty ? decimal(layer.pose.x) : VisualKeyframe.expression(layer.keyframes, key: \.x, variable: "t-\(start)")
+                let y = layer.keyframes.isEmpty ? decimal(layer.pose.y) : VisualKeyframe.expression(layer.keyframes, key: \.y, variable: "t-\(start)")
+                let output = "[layered\(i)]"
+                graph.append("\(video)[lv\(i)]overlay=x='W*(\(x))-w/2':y='H*(\(y))-h/2':enable='between(t,\(start),\(end))':eof_action=pass:repeatlast=0:format=auto\(output)")
+                video = output
+            }
+            if audioCount > 0, layer.audioGain > 0, !layer.media.audio.isEmpty {
+                graph.append("[las\(i)]atrim=start=\(decimal(layer.sourceRange.start)):duration=\(decimal(layer.sourceRange.duration)),asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=\(decimal(layer.audioGain)),adelay=\(Int(layer.startTime * 1000)):all=1[la\(i)]")
+                let out = "[mixed\(i)]"
+                graph.append("\(audio[0])[la\(i)]amix=inputs=2:duration=first:normalize=0\(out)"); audio[0] = out
+            }
+        }
+        let finalVideoFilter = prepared.burnSubtitleURL.map { "subtitles=filename='\(escapeFilterPath($0.path))'," } ?? ""
+        graph.append(video + finalVideoFilter + "trim=duration=\(decimal(edit.outputDuration)),setpts=PTS-STARTPTS[vout]")
+        var result = ["-filter_complex", "", "-map", "[vout]"]
+        for a in 0..<audioCount {
+            let normalize = config.audio.normalizeLoudness ? "loudnorm=I=\(decimal(config.audio.targetLoudnessLUFS)):TP=-1.5:LRA=11," : ""
+            graph.append(audio[a] + normalize + "atrim=duration=\(decimal(edit.outputDuration)),asetpts=PTS-STARTPTS[aout\(a)]")
+            result += ["-map", "[aout\(a)]"]
+        }
+        result[1] = graph.joined(separator: ";")
+        result += ["-t", decimal(edit.outputDuration)]
+        result += auxiliaryMappingArguments(configuration: config, inputPlan: inputPlan)
         return result
     }
 
@@ -630,13 +908,27 @@ struct FFmpegCommandBuilder: Sendable {
     private func clipVideoFilters(
         _ clip: EditSegment,
         request: ExportRequest,
-        canvas: (width: Int, height: Int)?
+        canvas: (width: Int, height: Int)?,
+        prepared: ExportPreparedAssets
     ) -> [String] {
         var filters = [
             "trim=start=\(decimal(clip.sourceRange.start)):duration=\(decimal(clip.sourceRange.duration))"
         ]
 
-        if request.configuration.subtitles.mode == .burn {
+        var clipRequest = request
+        if let media = clip.media {
+            clipRequest.sourceVideo = media.video
+            for index in clipRequest.configuration.trackSettings.indices where clipRequest.configuration.trackSettings[index].kind == .video {
+                clipRequest.configuration.trackSettings[index].sourceStream = media.video
+            }
+        }
+        filters += colorPlan(for: clipRequest).filters(lutFilters: prepared.lutFilters)
+        filters += clip.effects?.filters ?? []
+        if let crop = clip.transform.crop {
+            filters.append("crop=w='max(2,trunc(iw*\(decimal(crop.width))/2)*2)':h='max(2,trunc(ih*\(decimal(crop.height))/2)*2)':x='trunc(iw*\(decimal(crop.x))/2)*2':y='trunc(ih*\(decimal(crop.y))/2)*2'")
+        }
+
+        if clip.sourceURL == nil && request.configuration.subtitles.mode == .burn && prepared.burnSubtitleURL == nil {
             let escapedPath = escapeFilterPath(request.sourceURL.path)
             filters.append(
                 "subtitles=filename='\(escapedPath)':si=\(max(0, request.configuration.subtitles.burnStreamIndex))"
@@ -678,35 +970,10 @@ struct FFmpegCommandBuilder: Sendable {
     }
 
     private func clipAudioFilters(_ clip: EditSegment) -> [String] {
-        var filters = [
-            "atrim=start=\(decimal(clip.sourceRange.start)):duration=\(decimal(clip.sourceRange.duration))",
-            "asetpts=PTS-STARTPTS"
-        ]
-        filters += tempoFilters(for: clip.playbackRate)
-        if abs(clip.volume - 1) > 0.000_1 {
-            filters.append("volume=\(decimal(clip.volume))")
-        }
-        return filters
+        AudioClipProcessing.filters(clip)
     }
 
-    private func tempoFilters(for requestedRate: Double) -> [String] {
-        var rate = min(100, max(0.01, requestedRate))
-        var filters: [String] = []
-        while rate < 0.5 {
-            filters.append("atempo=0.500")
-            rate /= 0.5
-        }
-        while rate > 2 {
-            filters.append("atempo=2.000")
-            rate /= 2
-        }
-        if abs(rate - 1) > 0.000_1 {
-            filters.append("atempo=\(decimal(rate))")
-        }
-        return filters
-    }
-
-    private func compositionCanvasDimensions(
+    func compositionCanvasDimensions(
         for request: ExportRequest
     ) -> (width: Int, height: Int)? {
         let settings = request.configuration.video
@@ -736,7 +1003,8 @@ struct FFmpegCommandBuilder: Sendable {
 
     private func videoArguments(
         for request: ExportRequest,
-        includesSimpleFilters: Bool
+        includesSimpleFilters: Bool,
+        prepared: ExportPreparedAssets
     ) -> [String] {
         let settings = request.configuration.video
         var result = ["-c:v", settings.codec.ffmpegName]
@@ -746,8 +1014,9 @@ struct FFmpegCommandBuilder: Sendable {
             if settings.codec.isHardwareAccelerated {
                 result += ["-q:v", String(clamp(settings.quality, lower: 1, upper: 100))]
             } else {
-                let crf = Int((51.0 * (1.0 - Double(settings.quality) / 100.0)).rounded())
-                result += ["-crf", String(clamp(crf, lower: 0, upper: 51))]
+                let maximumCRF = settings.codec == .av1 ? 63 : 51
+                let crf = Int((Double(maximumCRF) * (1.0 - Double(settings.quality) / 100.0)).rounded())
+                result += ["-crf", String(clamp(crf, lower: 0, upper: maximumCRF))]
             }
         case .averageBitrate:
             result += bitrateArguments(settings: settings, averageKbps: settings.averageBitrateKbps)
@@ -757,23 +1026,25 @@ struct FFmpegCommandBuilder: Sendable {
         }
 
         if settings.codec.supportsSoftwarePreset {
-            result += ["-preset", settings.preset.rawValue]
+            result += ["-preset", settings.preset.ffmpegValue(for: settings.codec)]
             if let tune = settings.tune.ffmpegValue, settings.codec != .av1 {
                 result += ["-tune", tune]
             }
         }
 
-        if let profile = settings.profile.ffmpegValue {
+        if settings.codec == .av1, settings.profile == .main {
+            result += ["-profile:v", "0"]
+        } else if let profile = settings.profile.ffmpegValue {
             result += ["-profile:v", profile]
         }
 
         var videoFilters = includesSimpleFilters
-            ? simpleVideoFilters(configuration: request.configuration)
+            ? simpleVideoFilters(request: request, prepared: prepared)
             : []
         if includesSimpleFilters, request.configuration.subtitles.mode == .burn {
-            let escapedPath = escapeFilterPath(request.sourceURL.path)
+            let escapedPath = escapeFilterPath((prepared.burnSubtitleURL ?? request.sourceURL).path)
             videoFilters.append(
-                "subtitles=filename='\(escapedPath)':si=\(max(0, request.configuration.subtitles.burnStreamIndex))"
+                "subtitles=filename='\(escapedPath)':si=\(prepared.burnSubtitleURL == nil ? max(0, request.configuration.subtitles.burnStreamIndex) : 0)"
             )
         }
         if !videoFilters.isEmpty {
@@ -786,14 +1057,21 @@ struct FFmpegCommandBuilder: Sendable {
             result += ["-r", decimal(frameRate)]
         }
 
-        if let pixelFormat = settings.pixelFormat.ffmpegValue {
-            result += ["-pix_fmt", pixelFormat]
-        }
+        let outputFormat = ExportPlan(request: request).pixelFormat
+        // VideoToolbox accepts the semiplanar 10-bit equivalent, not planar yuv420p10le.
+        let encoderPixelFormat = settings.codec == .hevcVideoToolbox && outputFormat == .yuv420p10le
+            ? "p010le" : outputFormat.rawValue
+        result += ["-pix_fmt", encoderPixelFormat]
 
         if settings.keyframeIntervalSeconds > 0 {
-            let assumedFrameRate = frameRate ?? 30
-            let interval = max(1, Int((settings.keyframeIntervalSeconds * assumedFrameRate).rounded()))
-            result += ["-g", String(interval)]
+            let sourceRate = request.configuration.trackSettings.first { $0.isIncluded && $0.kind == .video }?.sourceStream?.frameRate
+                ?? request.sourceVideo?.frameRate
+            if let actualRate = frameRate ?? sourceRate, actualRate.isFinite, actualRate > 0 {
+                let interval = max(1, Int((settings.keyframeIntervalSeconds * actualRate).rounded()))
+                result += ["-g", String(interval)]
+            }
+            // A time-based bound also handles variable-frame-rate footage.
+            result += ["-force_key_frames", "expr:gte(t,n_forced*\(decimal(settings.keyframeIntervalSeconds)))"]
         }
         result += ["-bf", String(clamp(settings.bFrames, lower: 0, upper: 16))]
         return result
@@ -812,21 +1090,14 @@ struct FFmpegCommandBuilder: Sendable {
     }
 
     private func targetVideoBitrateKbps(for request: ExportRequest) -> Int {
-        let duration = request.editing.trimmedDuration ?? request.sourceDuration
-        guard let duration, duration > 0 else {
-            return request.configuration.video.averageBitrateKbps
-        }
-
-        let totalKbits = Double(max(1, request.configuration.video.targetSizeMB)) * 8_192
-        let audioKbps = request.configuration.audio.codec.usesBitrate
-            ? request.configuration.audio.bitrateKbps
-            : 0
-        return max(100, Int(totalKbits / duration) - audioKbps)
+        TargetSizeBudget(configuration: request.configuration,
+                         duration: request.editing.trimmedDuration ?? request.sourceDuration).videoKbps
     }
 
-    private func simpleVideoFilters(configuration: ExportConfiguration) -> [String] {
+    private func simpleVideoFilters(request: ExportRequest, prepared: ExportPreparedAssets) -> [String] {
+        let configuration = request.configuration
         let settings = configuration.video
-        var filters: [String] = []
+        var filters = colorPlan(for: request).filters(lutFilters: prepared.lutFilters)
 
         let dimensions = settings.resolution.dimensions
             ?? (settings.resolution == .custom
@@ -835,16 +1106,21 @@ struct FFmpegCommandBuilder: Sendable {
         if let dimensions {
             if settings.allowUpscaling {
                 filters.append(
-                    "scale=\(dimensions.0):\(dimensions.1):force_original_aspect_ratio=decrease"
+                    "scale=\(dimensions.0):\(dimensions.1):force_original_aspect_ratio=decrease:force_divisible_by=2"
                 )
             } else {
                 filters.append(
-                    "scale=w='min(\(dimensions.0),iw)':h='min(\(dimensions.1),ih)':force_original_aspect_ratio=decrease"
+                    "scale=w='min(\(dimensions.0),iw)':h='min(\(dimensions.1),ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
                 )
             }
         }
 
         return filters
+    }
+
+    private func colorPlan(for request: ExportRequest) -> ColorConversionPlan {
+        let source = request.configuration.trackSettings.first { $0.isIncluded && $0.kind == .video }?.sourceStream ?? request.sourceVideo
+        return ColorConversionPlan(settings: request.configuration.color, source: source)
     }
 
     private func audioArguments(
@@ -854,11 +1130,10 @@ struct FFmpegCommandBuilder: Sendable {
         let settings = request.configuration.audio
         guard let codec = settings.codec.ffmpegName else { return ["-an"] }
 
-        let outputCodec = !includesSimpleFilters && settings.codec == .copy ? "aac" : codec
-        var result = ["-c:a", outputCodec]
-        guard settings.codec != .copy || !includesSimpleFilters else { return result }
+        var result = ["-c:a", codec]
+        guard settings.codec != .copy else { return result }
 
-        if settings.codec.usesBitrate || (!includesSimpleFilters && settings.codec == .copy) {
+        if settings.codec.usesBitrate {
             result += ["-b:a", "\(max(32, settings.bitrateKbps))k"]
         }
         if settings.sampleRate != .source {
@@ -880,8 +1155,12 @@ struct FFmpegCommandBuilder: Sendable {
 
     private func subtitleArguments(
         configuration: ExportConfiguration,
-        usesComposition: Bool
+        usesComposition: Bool,
+        hasPreparedSubtitles: Bool = false
     ) -> [String] {
+        if hasPreparedSubtitles {
+            return ["-c:s", configuration.container == .mkv ? "ass" : subtitleCodec(for: configuration.container)]
+        }
         if usesComposition, configuration.subtitles.mode != .burn {
             return ["-sn"]
         }
@@ -904,12 +1183,12 @@ struct FFmpegCommandBuilder: Sendable {
         }
     }
 
-    private func containerArguments(configuration: ExportConfiguration) -> [String] {
+    private func containerArguments(configuration: ExportConfiguration, changesSourceTiming: Bool) -> [String] {
         var result: [String] = []
         result += configuration.containerOptions.preserveMetadata
             ? ["-map_metadata", "0"]
             : ["-map_metadata", "-1"]
-        result += configuration.containerOptions.preserveChapters
+        result += configuration.containerOptions.preserveChapters && !changesSourceTiming
             ? ["-map_chapters", "0"]
             : ["-map_chapters", "-1"]
 
@@ -919,7 +1198,12 @@ struct FFmpegCommandBuilder: Sendable {
         if configuration.containerOptions.normalizeTimestamps {
             result.append("-start_at_zero")
         }
-        if configuration.containerOptions.preventNegativeTimestamps {
+        if configuration.mode == .transcode {
+            // Encoder reorder / priming DTS can legitimately be negative. Shifting all
+            // packets to make DTS zero moves the first displayed video frame away from
+            // the edited subtitle and chapter clock. These containers support this delay.
+            result += ["-avoid_negative_ts", "disabled"]
+        } else if configuration.containerOptions.preventNegativeTimestamps {
             result += ["-avoid_negative_ts", "make_zero"]
         }
         return result
@@ -963,19 +1247,20 @@ struct FFmpegCommandBuilder: Sendable {
 
     private func trackMetadataArguments(
         configuration: ExportConfiguration,
-        usesComposition: Bool
+        usesComposition: Bool,
+        hasPreparedSubtitles: Bool = false
     ) -> [String] {
         guard !configuration.trackSettings.isEmpty else { return [] }
         var result: [String] = []
 
         for kind in [MediaStreamKind.video, .audio, .subtitle] {
-            if usesComposition, kind == .audio, configuration.audio.codec == .none {
+            if kind == .audio, configuration.audio.codec == .none {
                 continue
             }
             if kind == .subtitle,
                configuration.subtitles.mode == .remove
                 || configuration.subtitles.mode == .burn
-                || usesComposition {
+                || (usesComposition && !hasPreparedSubtitles) {
                 continue
             }
 
@@ -1059,7 +1344,7 @@ struct FFmpegCommandBuilder: Sendable {
     }
 }
 
-private struct FFmpegInputPlan {
+struct FFmpegInputPlan {
     struct Entry {
         let sourceURL: URL
         let subtitleOffset: TimeInterval?
@@ -1073,7 +1358,8 @@ private struct FFmpegInputPlan {
         primarySourceURL: URL,
         tracks: [TrackExportSettings],
         subtitleOffset: TimeInterval?,
-        includeFallbackSubtitleInput: Bool
+        includeFallbackSubtitleInput: Bool,
+        additionalURLs: [URL] = []
     ) {
         var plannedEntries = [Entry(sourceURL: primarySourceURL, subtitleOffset: nil)]
         var indicesByKey = [Self.key(for: primarySourceURL, subtitleOffset: nil): 0]
@@ -1092,6 +1378,13 @@ private struct FFmpegInputPlan {
                 indicesByKey[key] = inputIndex
             }
             indicesByTrack[track.id] = inputIndex
+        }
+        for sourceURL in additionalURLs {
+            let key = Self.key(for: sourceURL, subtitleOffset: nil)
+            if indicesByKey[key] == nil {
+                indicesByKey[key] = plannedEntries.count
+                plannedEntries.append(Entry(sourceURL: sourceURL, subtitleOffset: nil))
+            }
         }
 
         var fallbackIndex: Int?
@@ -1112,6 +1405,9 @@ private struct FFmpegInputPlan {
 
     func inputIndex(for track: TrackExportSettings) -> Int {
         trackInputIndices[track.id] ?? 0
+    }
+    func inputIndex(for url: URL) -> Int {
+        entries.firstIndex { $0.sourceURL.standardizedFileURL == url.standardizedFileURL && $0.subtitleOffset == nil } ?? 0
     }
 
     func arguments(inputSeek: TimeInterval?) -> [String] {
@@ -1174,15 +1470,11 @@ private struct FFprobePayload: Decodable {
 
     struct Stream: Decodable {
         struct Tags: Decodable {
-            let language: String?
-            let title: String?
-            let handlerName: String?
-
-            enum CodingKeys: String, CodingKey {
-                case language
-                case title
-                case handlerName = "handler_name"
-            }
+            let values: [String: String]
+            var language: String? { values["language"] }
+            var title: String? { values["title"] }
+            var handlerName: String? { values["handler_name"] }
+            init(from decoder: Decoder) throws { values = try decoder.singleValueContainer().decode([String: String].self) }
         }
 
         struct Disposition: Decodable {
@@ -1197,17 +1489,23 @@ private struct FFprobePayload: Decodable {
 
         struct SideData: Decodable {
             let type: String?
+            let doviProfile: Int?
+            let doviCompatibilityID: Int?
 
             enum CodingKeys: String, CodingKey {
                 case type = "side_data_type"
+                case doviProfile = "dv_profile"
+                case doviCompatibilityID = "dv_bl_signal_compatibility_id"
             }
         }
 
         let index: Int
         let codecName: String?
+        let codecProfile: String?
         let codecType: String?
         let width: Int?
         let height: Int?
+        let averageFrameRate: String?
         let sampleRate: String?
         let channels: Int?
         let bitRate: String?
@@ -1216,6 +1514,8 @@ private struct FFprobePayload: Decodable {
         let colorSpace: String?
         let colorTransfer: String?
         let colorPrimaries: String?
+        let colorRange: String?
+        let chromaLocation: String?
         let tags: Tags?
         let disposition: Disposition?
         let sideDataList: [SideData]?
@@ -1223,9 +1523,11 @@ private struct FFprobePayload: Decodable {
         enum CodingKeys: String, CodingKey {
             case index
             case codecName = "codec_name"
+            case codecProfile = "profile"
             case codecType = "codec_type"
             case width
             case height
+            case averageFrameRate = "avg_frame_rate"
             case sampleRate = "sample_rate"
             case channels
             case bitRate = "bit_rate"
@@ -1234,6 +1536,8 @@ private struct FFprobePayload: Decodable {
             case colorSpace = "color_space"
             case colorTransfer = "color_transfer"
             case colorPrimaries = "color_primaries"
+            case colorRange = "color_range"
+            case chromaLocation = "chroma_location"
             case tags
             case disposition
             case sideDataList = "side_data_list"
@@ -1261,6 +1565,12 @@ private struct FFprobePayload: Decodable {
     let format: Format?
     let streams: [Stream]
     let chapters: [Chapter]?
+    struct Frame: Decodable {
+        let streamIndex: Int?
+        let sideDataList: [Stream.SideData]?
+        enum CodingKeys: String, CodingKey { case streamIndex = "stream_index", sideDataList = "side_data_list" }
+    }
+    let frames: [Frame]?
 
     func mediaProbe(sourceURL: URL) -> MediaProbe {
         MediaProbe(
@@ -1269,12 +1579,14 @@ private struct FFprobePayload: Decodable {
             duration: format?.duration.flatMap(TimeInterval.init),
             sizeInBytes: format?.size.flatMap(Int64.init),
             streams: streams.map { stream in
-                MediaStream(
+                var result = MediaStream(
                     index: stream.index,
                     kind: MediaStreamKind(rawValue: stream.codecType ?? "") ?? .unknown,
                     codecName: stream.codecName,
+                    codecProfile: stream.codecProfile,
                     width: stream.width,
                     height: stream.height,
+                    averageFrameRate: stream.averageFrameRate,
                     sampleRate: stream.sampleRate.flatMap(Int.init),
                     channels: stream.channels,
                     language: stream.tags?.language,
@@ -1286,9 +1598,16 @@ private struct FFprobePayload: Decodable {
                     colorSpace: stream.colorSpace,
                     colorTransfer: stream.colorTransfer,
                     colorPrimaries: stream.colorPrimaries,
+                    colorRange: stream.colorRange,
+                    chromaLocation: stream.chromaLocation,
                     isAttachedPicture: stream.disposition?.attachedPicture == 1,
-                    sideDataTypes: stream.sideDataList?.compactMap(\.type) ?? []
+                    sideDataTypes: Array(Set((stream.sideDataList?.compactMap(\.type) ?? [])
+                        + (frames ?? []).filter { $0.streamIndex == stream.index }.flatMap { $0.sideDataList?.compactMap(\.type) ?? [] })).sorted()
                 )
+                result.metadata = (format?.tags ?? [:]).merging(stream.tags?.values ?? [:], uniquingKeysWith: { _, new in new })
+                result.dolbyVisionProfile = stream.sideDataList?.compactMap(\.doviProfile).first
+                result.dolbyVisionCompatibilityID = stream.sideDataList?.compactMap(\.doviCompatibilityID).first
+                return result
             },
             metadata: format?.tags ?? [:],
             bitRate: format?.bitRate.flatMap(Int64.init),

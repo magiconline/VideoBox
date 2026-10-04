@@ -6,6 +6,24 @@ struct EditSettings: Codable, Equatable, Sendable {
     var sourceDuration = 0.0
     var canvasWidth: Int?
     var canvasHeight: Int?
+    var layers: [OverlayClip]?
+    var overlayClips: [OverlayClip] { get { layers ?? [] } set { layers = newValue } }
+    var referencedURLs: [URL] { clips.compactMap(\.sourceURL) + overlayClips.map(\.sourceURL) }
+    var requiresRenderedPreview: Bool {
+        !overlayClips.isEmpty || clips.contains { $0.sourceURL != nil || $0.transform.crop != nil
+            || $0.effects != nil || !($0.keyframes ?? []).isEmpty || ($0.transition?.duration ?? 0) > 0 }
+    }
+    var clipStartTimes: [Double] {
+        var time = 0.0
+        return clips.enumerated().map { index, clip in
+            if index > 0 { time -= transitionDuration(at: index) }
+            let start = time; time += clip.outputDuration; return start
+        }
+    }
+    func transitionDuration(at index: Int) -> Double {
+        guard index > 0, clips.indices.contains(index) else { return 0 }
+        return min(max(0, clips[index].transition?.duration ?? 0), min(clips[index - 1].outputDuration, clips[index].outputDuration) / 2)
+    }
 
     var selectedClipIndex: Int? {
         guard let selectedClipID else { return nil }
@@ -18,7 +36,7 @@ struct EditSettings: Codable, Equatable, Sendable {
     }
 
     var outputDuration: TimeInterval {
-        clips.reduce(0) { $0 + $1.outputDuration }
+        max(0, clips.reduce(0) { $0 + $1.outputDuration } - clips.indices.reduce(0) { $0 + transitionDuration(at: $1) })
     }
 
     var trimmedDuration: TimeInterval? {
@@ -26,7 +44,7 @@ struct EditSettings: Codable, Equatable, Sendable {
     }
 
     var requiresFilterComposition: Bool {
-        clips.count > 1 || clips.contains { !$0.hasDefaultTreatment }
+        !overlayClips.isEmpty || clips.count > 1 || clips.contains { !$0.hasDefaultTreatment }
     }
 
     mutating func initialize(
@@ -42,17 +60,21 @@ struct EditSettings: Codable, Equatable, Sendable {
             sourceRange: TimelineRange(start: 0, duration: safeDuration)
         )
         clips = safeDuration > 0 ? [clip] : []
+        layers = nil
         selectedClipID = clips.first?.id
     }
 
     func location(atOutputTime requestedTime: TimeInterval) -> TimelineLocation? {
         guard !clips.isEmpty else { return nil }
         let time = min(max(0, requestedTime), outputDuration)
-        var cursor = 0.0
+        let starts = clipStartTimes
 
         for (index, clip) in clips.enumerated() {
-            let end = cursor + clip.outputDuration
-            if time < end || index == clips.indices.last {
+            let cursor = starts[index]
+            let end = index + 1 < starts.count ? starts[index + 1] : outputDuration
+            // The composition's CMTime may round a cut by a few microseconds.
+            // Keep a playhead at that cut on the right-hand clip after splitting.
+            if time < end - 0.000_01 || index == clips.indices.last {
                 let localOutputTime = min(max(0, time - cursor), clip.outputDuration)
                 return TimelineLocation(
                     clipIndex: index,
@@ -62,22 +84,17 @@ struct EditSettings: Codable, Equatable, Sendable {
                     sourceTime: clip.sourceRange.start + localOutputTime * clip.playbackRate
                 )
             }
-            cursor = end
         }
         return nil
     }
 
     func outputStart(of clipID: UUID) -> TimeInterval? {
-        var cursor = 0.0
-        for clip in clips {
-            if clip.id == clipID { return cursor }
-            cursor += clip.outputDuration
-        }
-        return nil
+        guard let index = clips.firstIndex(where: { $0.id == clipID }) else { return nil }
+        return clipStartTimes[index]
     }
 
     func simpleTrimRange() -> TimelineRange? {
-        guard clips.count == 1, let clip = clips.first, clip.hasDefaultTreatment else { return nil }
+        guard overlayClips.isEmpty, clips.count == 1, let clip = clips.first, clip.hasDefaultTreatment else { return nil }
         let isFullSource = abs(clip.sourceRange.start) < 0.000_1
             && abs(clip.sourceRange.duration - sourceDuration) < 0.000_1
         return isFullSource ? nil : clip.sourceRange
@@ -97,16 +114,15 @@ struct EditSettings: Codable, Equatable, Sendable {
         }
 
         clips[location.clipIndex].sourceRange.duration = sourceOffset
-        let right = EditSegment(
-            sourceRange: TimelineRange(
-                start: original.sourceRange.start + sourceOffset,
-                duration: original.sourceRange.duration - sourceOffset
-            ),
-            playbackRate: original.playbackRate,
-            transform: original.transform,
-            volume: original.volume,
-            scale: original.scale
-        )
+        var right = original
+        right.id = UUID(); right.transition = nil
+        right.sourceRange = TimelineRange(start: original.sourceRange.start + sourceOffset, duration: original.sourceRange.duration - sourceOffset)
+        let boundary = location.localOutputTime
+        if let frames = original.keyframes, !frames.isEmpty {
+            let pose = VisualKeyframe.interpolate(frames, at: boundary)
+            clips[location.clipIndex].keyframes = frames.filter { $0.time < boundary } + [VisualKeyframe(time: boundary, pose: pose)]
+            right.keyframes = [VisualKeyframe(time: 0, pose: pose)] + frames.filter { $0.time > boundary }.map { VisualKeyframe(time: $0.time - boundary, pose: $0.pose) }
+        }
         clips.insert(right, at: location.clipIndex + 1)
         selectedClipID = right.id
         return right.id
@@ -121,14 +137,8 @@ struct EditSettings: Codable, Equatable, Sendable {
     @discardableResult
     mutating func duplicateSelectedClip() -> UUID? {
         guard let index = selectedClipIndex else { return nil }
-        let source = clips[index]
-        let duplicate = EditSegment(
-            sourceRange: source.sourceRange,
-            playbackRate: source.playbackRate,
-            transform: source.transform,
-            volume: source.volume,
-            scale: source.scale
-        )
+        var duplicate = clips[index]
+        duplicate.id = UUID()
         clips.insert(duplicate, at: index + 1)
         selectedClipID = duplicate.id
         return duplicate.id
@@ -158,6 +168,7 @@ struct EditSettings: Codable, Equatable, Sendable {
         clips[index].transform = .identity
         clips[index].volume = 1
         clips[index].scale = 1
+        clips[index].effects = nil; clips[index].keyframes = nil; clips[index].transition = nil
     }
 
     func timeline(for sourceURL: URL) -> EditTimeline {
@@ -184,12 +195,17 @@ struct EditTimeline: Codable, Equatable, Sendable {
 }
 
 struct EditSegment: Codable, Equatable, Identifiable, Sendable {
-    let id: UUID
+    var id: UUID
     var sourceRange: TimelineRange
     var playbackRate: Double
     var transform: VideoTransform
     var volume: Double
     var scale: Double
+    var sourceURL: URL?
+    var media: ClipMedia?
+    var effects: ClipEffects?
+    var keyframes: [VisualKeyframe]?
+    var transition: ClipTransition?
 
     init(
         id: UUID = UUID(),
@@ -216,6 +232,7 @@ struct EditSegment: Codable, Equatable, Identifiable, Sendable {
             && transform == .identity
             && abs(volume - 1) < 0.000_1
             && abs(scale - 1) < 0.000_1
+            && sourceURL == nil && effects == nil && (keyframes ?? []).isEmpty && transition == nil
     }
 }
 

@@ -19,6 +19,7 @@ Exact corresponding source code, including the build scripts and configuration n
 | FriBidi | 1.0.16 | <https://github.com/fribidi/fribidi> | LGPL-2.1-or-later |
 | HarfBuzz | 14.3.1 | <https://github.com/harfbuzz/harfbuzz> | MIT |
 | libunibreak | 7.0 | <https://github.com/adah1972/libunibreak> | Zlib |
+| zimg | 3.0.6 | <https://github.com/sekrit-twc/zimg> | WTFPL-2.0 |
 
 Copies of the applicable license texts are installed inside `VideoBox.app/Contents/Resources/Licenses`. Copyright notices in the upstream sources remain intact.
 

@@ -52,7 +52,7 @@ final class FFmpegCommandBuilderTests: XCTestCase {
 
         let arguments = FFmpegCommandBuilder().arguments(for: request)
 
-        XCTAssertTrue(arguments.containsSequence(["-b:v", "8064k"]))
+        XCTAssertTrue(arguments.containsSequence(["-b:v", "8003k"]))
     }
 
     func testTrackEditorControlsMappingAndPerTrackMetadata() {
@@ -107,6 +107,29 @@ final class FFmpegCommandBuilderTests: XCTestCase {
         XCTAssertTrue(arguments.containsSequence(["-metadata", "title=旅行视频"]))
         XCTAssertTrue(arguments.containsSequence(["-metadata", "comment=Created in VideoBox"]))
         XCTAssertFalse(arguments.contains("   =ignored"))
+    }
+
+    func testAttachmentAndDataRetentionRespectsBothGlobalAndPerTrackChoices() {
+        var configuration = ExportConfiguration()
+        configuration.mode = .streamCopy
+        configuration.trackSettings = [TrackExportSettings(streamIndex: 0, kind: .video),
+            TrackExportSettings(streamIndex: 3, kind: .attachment), TrackExportSettings(streamIndex: 4, kind: .data)]
+        configuration.includeAttachments = false
+        configuration.includeDataStreams = false
+        var args = FFmpegCommandBuilder().arguments(for: makeRequest(configuration: configuration))
+        XCTAssertFalse(args.containsSequence(["-map", "0:3?"]))
+        XCTAssertFalse(args.containsSequence(["-map", "0:4?"]))
+        configuration.includeAttachments = true
+        configuration.includeDataStreams = true
+        args = FFmpegCommandBuilder().arguments(for: makeRequest(configuration: configuration))
+        XCTAssertTrue(args.containsSequence(["-map", "0:3?"]))
+        XCTAssertTrue(args.containsSequence(["-map", "0:4?"]))
+        XCTAssertFalse(args.containsSequence(["-map", "0:t?"]))
+        XCTAssertFalse(args.containsSequence(["-map", "0:d?"]))
+        configuration.trackSettings[1].isIncluded = false
+        args = FFmpegCommandBuilder().arguments(for: makeRequest(configuration: configuration))
+        XCTAssertFalse(args.containsSequence(["-map", "0:3?"]))
+        XCTAssertFalse(args.containsSequence(["-map", "0:t?"]))
     }
 
     func testMultipleSourceTracksUseDistinctInputsAndKeepUserOrder() {
@@ -384,9 +407,9 @@ final class FFmpegCommandBuilderTests: XCTestCase {
         XCTAssertEqual(configuration.trackSettings[2].kind, .subtitle)
     }
 
-    func testClipCompositionBuildsSplitFiltersAndForcesTranscode() {
+    func testClipCompositionBuildsSplitFiltersInExplicitTranscodeMode() {
         var configuration = ExportConfiguration()
-        configuration.mode = .streamCopy
+        configuration.mode = .transcode
         configuration.trackSettings = [
             TrackExportSettings(streamIndex: 0, kind: .video),
             TrackExportSettings(streamIndex: 1, kind: .audio)
@@ -422,6 +445,113 @@ final class FFmpegCommandBuilderTests: XCTestCase {
         XCTAssertTrue(arguments.contains("-sn"))
         XCTAssertFalse(arguments.contains("-c:s"))
         XCTAssertFalse(arguments.containsSequence(["-c", "copy"]))
+    }
+
+    func testLUTTranscodeTagsRec709Output() {
+        var configuration = ExportConfiguration()
+        configuration.mode = .transcode
+        configuration.color.isLUTEnabled = true
+        configuration.color.lutFile = LUTFileReference(
+            url: URL(fileURLWithPath: "/tmp/DJI D-Log M.cube")
+        )
+        configuration.color.outputColorSpace = .rec709SDR
+        configuration.color.outputRange = .limited
+        configuration.video.pixelFormat = .yuv420p10le
+        let request = makeRequest(configuration: configuration)
+
+        let arguments = FFmpegCommandBuilder().arguments(for: request)
+        let filters = arguments.value(after: "-vf") ?? ""
+
+        XCTAssertTrue(filters.contains("lut3d=file='/tmp/DJI D-Log M.cube':interp=trilinear"))
+        XCTAssertTrue(filters.contains("setparams=range=limited"))
+        XCTAssertTrue(arguments.containsSequence(["-c:v", "hevc_videotoolbox"]))
+        XCTAssertTrue(arguments.containsSequence(["-pix_fmt", "p010le"]))
+        XCTAssertTrue(arguments.containsSequence(["-color_primaries", "bt709"]))
+        XCTAssertTrue(arguments.containsSequence(["-color_trc", "bt709"]))
+        XCTAssertTrue(arguments.containsSequence(["-colorspace", "bt709"]))
+        XCTAssertTrue(arguments.containsSequence(["-color_range", "tv"]))
+        XCTAssertFalse(arguments.containsSequence(["-c", "copy"]))
+    }
+
+    func testMatchingColorDeclarationsNeverChangeQuickExportIntoTranscode() throws {
+        var configuration = ExportConfiguration()
+        configuration.color.outputColorSpace = .rec709SDR
+        configuration.color.outputRange = .limited
+        let source = MediaStream(index: 0, kind: .video, codecName: "h264", width: 1920, height: 1080,
+                                 sampleRate: nil, channels: nil, language: nil, pixelFormat: "yuv420p",
+                                 colorSpace: "bt709", colorTransfer: "bt709", colorPrimaries: "bt709", colorRange: "tv")
+        let request = ExportRequest(sourceURL: URL(fileURLWithPath: "/tmp/input.mp4"),
+                                    destinationURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                                    sourceVideo: source, configuration: configuration, editing: EditSettings())
+        try ExportPlan(request: request).validate()
+        let arguments = FFmpegCommandBuilder().arguments(for: request)
+        XCTAssertTrue(arguments.containsSequence(["-c", "copy"]))
+        XCTAssertFalse(arguments.contains("-c:v"))
+        XCTAssertFalse(arguments.contains("-vf"))
+        XCTAssertFalse(arguments.contains("-color_trc"))
+    }
+
+    func testQuickExportRemovesAudioWithoutReencodingVideo() {
+        var configuration = ExportConfiguration()
+        configuration.audio.codec = .none
+        configuration.trackSettings = [TrackExportSettings(streamIndex: 0, kind: .video),
+                                       TrackExportSettings(streamIndex: 1, kind: .audio)]
+        let arguments = FFmpegCommandBuilder().arguments(for: makeRequest(configuration: configuration))
+        XCTAssertTrue(arguments.containsSequence(["-map", "0:0?"]))
+        XCTAssertFalse(arguments.containsSequence(["-map", "0:1?"]))
+        XCTAssertTrue(arguments.containsSequence(["-c", "copy"]))
+        XCTAssertTrue(arguments.contains("-an"))
+        XCTAssertFalse(arguments.contains("-c:v"))
+    }
+
+    func testAV1UsesNumericPresetAndMainProfile() {
+        var configuration = ExportConfiguration()
+        configuration.mode = .transcode
+        configuration.video.codec = .av1
+        configuration.video.profile = .main
+        configuration.video.rateControl = .constantQuality
+        configuration.video.quality = 50
+        let arguments = FFmpegCommandBuilder().arguments(for: makeRequest(configuration: configuration))
+        XCTAssertTrue(arguments.containsSequence(["-preset", "6"]))
+        XCTAssertTrue(arguments.containsSequence(["-profile:v", "0"]))
+        XCTAssertTrue(arguments.containsSequence(["-crf", "32"]))
+    }
+
+    func test480pScaleConstrainsBothDimensionsToEvenValues() {
+        var configuration = ExportConfiguration()
+        configuration.mode = .transcode
+        configuration.video.codec = .h264
+        configuration.video.resolution = .sd480
+        let arguments = FFmpegCommandBuilder().arguments(for: makeRequest(configuration: configuration))
+        XCTAssertTrue(arguments.value(after: "-vf")?.contains("force_divisible_by=2") == true)
+    }
+
+    func testInvalidQuickLUTRequestIsRejectedRatherThanChangingModes() {
+        var configuration = ExportConfiguration()
+        configuration.color.isLUTEnabled = true
+        configuration.color.lutFile = LUTFileReference(url: URL(fileURLWithPath: "/tmp/sample.cube"))
+        let request = makeRequest(configuration: configuration)
+        XCTAssertThrowsError(try ExportPlan(request: request).validate())
+        let arguments = FFmpegCommandBuilder().arguments(for: request)
+        XCTAssertTrue(arguments.containsSequence(["-c", "copy"]))
+        XCTAssertFalse(arguments.contains("-c:v"))
+    }
+
+    func testChangedTimelineRemovesSourceChaptersWhileUnchangedSplitCanKeepThem() {
+        var configuration = ExportConfiguration()
+        configuration.mode = .transcode
+        var editing = EditSettings()
+        editing.initialize(duration: 10, canvasWidth: 1920, canvasHeight: 1080)
+        _ = editing.split(atOutputTime: 4)
+        var request = ExportRequest(sourceURL: URL(fileURLWithPath: "/tmp/source.mp4"),
+                                    destinationURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                                    configuration: configuration, editing: editing)
+        XCTAssertFalse(editing.changesSourceTimingForExport)
+        XCTAssertTrue(FFmpegCommandBuilder().arguments(for: request).containsSequence(["-map_chapters", "0"]))
+        editing.clips.removeLast()
+        request.editing = editing
+        XCTAssertTrue(editing.changesSourceTimingForExport)
+        XCTAssertTrue(FFmpegCommandBuilder().arguments(for: request).containsSequence(["-map_chapters", "-1"]))
     }
 
     private func makeRequest(configuration: ExportConfiguration) -> ExportRequest {

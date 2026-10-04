@@ -29,6 +29,21 @@ struct CLIResult: Sendable {
 
 protocol CLIProcessRunning: Sendable {
     func run(_ command: CLICommand) async throws -> CLIResult
+    func run(
+        _ command: CLICommand,
+        onStandardOutput: (@Sendable (String) -> Void)?
+    ) async throws -> CLIResult
+}
+
+extension CLIProcessRunning {
+    func run(
+        _ command: CLICommand,
+        onStandardOutput: (@Sendable (String) -> Void)?
+    ) async throws -> CLIResult {
+        let result = try await run(command)
+        onStandardOutput?(result.standardOutput)
+        return result
+    }
 }
 
 enum CLIProcessError: LocalizedError {

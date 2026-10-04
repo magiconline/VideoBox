@@ -13,16 +13,19 @@ struct ClipTimelineEditorView: View {
     @State private var playheadTime = 0.0
     @State private var isScrubbing = false
     @State private var draggedClipID: UUID?
+    @State private var seekText = ""
+    @State private var inputText = ""
+    @State private var outputText = ""
+    @State private var trimError: String?
+    @State private var isShowingAdvanced = false
+    @State private var edgeDrag: (UUID, Bool, TimelineRange)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             toolbar
 
-            TimelineRulerView(duration: editing.outputDuration)
-                .frame(height: 18)
-
             timelineStrip
-                .frame(height: 82)
+                .frame(height: 108)
 
             selectedClipControls
         }
@@ -37,24 +40,29 @@ struct ClipTimelineEditorView: View {
                 thumbnails = []
                 return
             }
-            thumbnails = await TimelineThumbnailGenerator.generate(
+            let generated = await TimelineThumbnailGenerator.generate(
                 sourceURL: sourceURL,
                 duration: sourceDuration,
                 count: 24
             )
+            guard !Task.isCancelled else { return }
+            thumbnails = generated
         }
-        .onAppear {
-            synchronizeSelectionPreview()
+        .background(PlayerInputFocusRegion(playerController: playerController))
+        .sheet(isPresented: $isShowingAdvanced) {
+            ClipAdvancedEditor(editing: $editing, localTime: max(0, playheadTime - (editing.selectedClipID.flatMap { editing.outputStart(of: $0) } ?? 0)), changed: clipTreatmentChanged)
         }
-        .onChange(of: editing.selectedClipID) { _ in
-            synchronizeSelectionPreview()
-        }
+        .onAppear { playheadTime = playerController.outputTime; syncTrimFields(); playerController.setEditPoint = setEditPoint }
+        .onDisappear { playerController.setEditPoint = nil; if isScrubbing { playerController.endScrubbing() } }
+        .onChange(of: editing.selectedClipID) { _ in syncTrimFields() }
         .onChange(of: editing.clips) { _ in
             playheadTime = min(playheadTime, editing.outputDuration)
-            synchronizeSelectionPreview()
+            syncTrimFields()
         }
-        .onChange(of: playerController.currentTime) { sourceTime in
-            synchronizePlayhead(with: sourceTime)
+        .onChange(of: playerController.outputTime) { outputTime in
+            guard !isScrubbing else { return }
+            playheadTime = outputTime
+            if let clipID = playerController.activeClip?.id { editing.selectedClipID = clipID }
         }
     }
 
@@ -64,6 +72,11 @@ struct ClipTimelineEditorView: View {
                 .font(.headline)
 
             Spacer(minLength: 8)
+            TextField("00:00:00.000", text: $seekText)
+                .font(.caption.monospacedDigit()).frame(width: 108)
+                .onSubmit { if let time = Timecode.parse(seekText), time <= editing.outputDuration { scrub(to: time); trimError = nil } else { trimError = "请输入有效的剪后时间（秒或 时:分:秒.毫秒）" } }
+                .help("输入剪后时间码并按回车定位")
+            Button("定位") { if let time = Timecode.parse(seekText), time <= editing.outputDuration { scrub(to: time) } else { trimError = "时间码无效或超过成片时长" } }.controlSize(.small)
 
             TimelineToolButton(
                 systemName: "scissors",
@@ -109,73 +122,87 @@ struct ClipTimelineEditorView: View {
 
     private var timelineStrip: some View {
         GeometryReader { proxy in
-            let contentWidth = max(proxy.size.width, CGFloat(max(1, editing.clips.count)) * 92)
+            let layout = TimelineLayout(
+                durations: editing.clips.indices.map { editing.clips[$0].outputDuration - editing.transitionDuration(at: $0 + 1) },
+                viewportWidth: proxy.size.width
+            )
 
-            ScrollView(.horizontal, showsIndicators: editing.clips.count > 8) {
-                ZStack(alignment: .topLeading) {
-                    HStack(spacing: segmentSpacing) {
-                        ForEach(Array(editing.clips.enumerated()), id: \.element.id) { index, clip in
-                            let width = segmentWidth(
-                                for: clip,
-                                contentWidth: contentWidth
-                            )
-                            TimelineClipCell(
-                                clip: clip,
-                                number: index + 1,
-                                width: width,
-                                thumbnails: thumbnails,
-                                sourceDuration: sourceDuration ?? 0,
-                                isSelected: editing.selectedClipID == clip.id,
-                                dragProvider: {
-                                    draggedClipID = clip.id
-                                    return NSItemProvider(object: clip.id.uuidString as NSString)
-                                }
-                            )
-                            .contentShape(Rectangle())
-                            .onDrop(
-                                of: [UTType.text],
-                                delegate: ClipDropDelegate(
-                                    targetClipID: clip.id,
-                                    editing: $editing,
-                                    draggedClipID: $draggedClipID,
-                                    didMove: timelineWasEdited
+            ScrollView(.horizontal, showsIndicators: layout.contentWidth > proxy.size.width) {
+                VStack(spacing: 8) {
+                    TimelineRulerView(layout: layout)
+                        .frame(width: layout.contentWidth, height: 18)
+                        .contentShape(Rectangle())
+                        .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                            if !isScrubbing { playerController.beginScrubbing() }; isScrubbing = true
+                            scrub(to: layout.time(atX: value.location.x))
+                        }.onEnded { value in
+                            scrub(to: layout.time(atX: value.location.x)); isScrubbing = false; playerController.endScrubbing()
+                        })
+
+                    ZStack(alignment: .topLeading) {
+                        HStack(spacing: layout.spacing) {
+                            ForEach(Array(editing.clips.enumerated()), id: \.element.id) { index, clip in
+                                TimelineClipCell(
+                                    clip: clip,
+                                    number: index + 1,
+                                    width: layout.segments[index].width,
+                                    thumbnails: clip.sourceURL == nil ? thumbnails : [],
+                                    sourceDuration: sourceDuration ?? 0,
+                                    isSelected: editing.selectedClipID == clip.id,
+                                    dragProvider: {
+                                        draggedClipID = clip.id
+                                        return NSItemProvider(object: clip.id.uuidString as NSString)
+                                    }
                                 )
-                            )
+                                .contentShape(Rectangle())
+                                .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                                    guard edgeDrag == nil else { return }
+                                    if !isScrubbing { playerController.beginScrubbing() }; isScrubbing = true
+                                    scrub(to: editing.clipStartTimes[index] + max(0, min(1, value.location.x / max(1, layout.segments[index].width))) * layout.segments[index].duration)
+                                }.onEnded { _ in if isScrubbing { isScrubbing = false; playerController.endScrubbing() } })
+                                .overlay(alignment: .leading) { trimHandle(clip: clip, start: true, pixelsPerSecond: layout.segments[index].width / max(0.01, clip.outputDuration)) }
+                                .overlay(alignment: .trailing) { trimHandle(clip: clip, start: false, pixelsPerSecond: layout.segments[index].width / max(0.01, clip.outputDuration)) }
+                                .contextMenu {
+                                    Button("选择片段") { editing.selectedClipID = clip.id }
+                                    Button("片段设置…") { editing.selectedClipID = clip.id; isShowingAdvanced = true }
+                                    Button("复制") { editing.selectedClipID = clip.id; duplicateSelectedClip() }
+                                    Button("删除") { editing.selectedClipID = clip.id; deleteSelectedClip() }.disabled(editing.clips.count <= 1)
+                                }
+                                .onDrop(
+                                    of: [UTType.text],
+                                    delegate: ClipDropDelegate(
+                                        targetClipID: clip.id,
+                                        editing: $editing,
+                                        draggedClipID: $draggedClipID,
+                                        didMove: timelineWasEdited
+                                    )
+                                )
+                            }
                         }
-                    }
-                    .frame(width: contentWidth, height: 76, alignment: .leading)
+                        .frame(width: layout.contentWidth, height: 76, alignment: .leading)
 
-                    Rectangle()
-                        .fill(Color.white.opacity(0.92))
-                        .frame(width: 1, height: 76)
-                        .shadow(color: .black.opacity(0.5), radius: 1)
-                        .overlay(alignment: .top) {
-                            Image(systemName: "arrowtriangle.down.fill")
-                                .font(.system(size: 9))
-                                .foregroundStyle(Color.white)
-                                .offset(y: -2)
-                        }
-                        .offset(x: playheadX(contentWidth: contentWidth))
-                        .allowsHitTesting(false)
+                        Rectangle()
+                            .fill(Color.white.opacity(0.92))
+                            .frame(width: 1, height: 76)
+                            .shadow(color: .black.opacity(0.5), radius: 1)
+                            .overlay(alignment: .top) {
+                                Image(systemName: "arrowtriangle.down.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(Color.white)
+                                    .offset(y: -2)
+                            }
+                            .offset(x: min(layout.contentWidth - 1, layout.x(atTime: playheadTime)))
+                            .allowsHitTesting(false)
+                    }
+                    .frame(width: layout.contentWidth, height: 76)
+                    .contentShape(Rectangle())
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(Color.secondary.opacity(0.28), lineWidth: 1)
+                    }
                 }
-                .frame(width: contentWidth, height: 76)
-                .contentShape(Rectangle())
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                        .onChanged { value in
-                            isScrubbing = true
-                            scrub(toX: value.location.x, contentWidth: contentWidth)
-                        }
-                        .onEnded { value in
-                            scrub(toX: value.location.x, contentWidth: contentWidth)
-                            isScrubbing = false
-                        }
-                )
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 7))
-            .overlay {
-                RoundedRectangle(cornerRadius: 7)
-                    .stroke(Color.secondary.opacity(0.28), lineWidth: 1)
+                .frame(width: layout.contentWidth)
             }
         }
     }
@@ -189,6 +216,12 @@ struct ClipTimelineEditorView: View {
                 HStack(spacing: 6) {
                     Text("片段 \(index + 1)")
                         .font(.subheadline.bold())
+                    Button("入点 I") { setEditPoint(true) }.help("将当前播放头设置为片段入点")
+                    TextField("入点", text: $inputText).frame(width: 104).font(.caption.monospacedDigit())
+                    Button("出点 O") { setEditPoint(false) }.help("将当前播放头设置为片段出点")
+                    TextField("出点", text: $outputText).frame(width: 104).font(.caption.monospacedDigit())
+                    Button("修剪") { applyTrim() }
+                    Button("裁剪 / 调色 / 动画 / 转场…") { isShowingAdvanced = true }
 
                     Menu {
                         ForEach([0.5, 0.75, 1, 1.25, 1.5, 2], id: \.self) { rate in
@@ -247,7 +280,7 @@ struct ClipTimelineEditorView: View {
                     )
 
                     compactSlider(
-                        title: "音量",
+                        title: "片段音量（会应用到导出；播放器监听音量不影响导出）",
                         systemName: "speaker.wave.2",
                         value: Binding(
                             get: { editing.clips[index].volume * 100 },
@@ -270,6 +303,7 @@ struct ClipTimelineEditorView: View {
                 .fixedSize(horizontal: true, vertical: false)
                 .padding(.vertical, 1)
             }
+            if let trimError { Text(trimError).font(.caption).foregroundStyle(.orange) }
         } else {
             Text("拖动时间线开始预览，或选择一个片段进行编辑。")
                 .font(.caption)
@@ -300,50 +334,41 @@ struct ClipTimelineEditorView: View {
         "\(sourceURL.path)|\(sourceDuration ?? -1)"
     }
 
-    private var segmentSpacing: CGFloat { 3 }
-
-    private func segmentWidth(for clip: EditSegment, contentWidth: CGFloat) -> CGFloat {
-        let totalSpacing = segmentSpacing * CGFloat(max(0, editing.clips.count - 1))
-        let usableWidth = max(1, contentWidth - totalSpacing)
-        guard editing.outputDuration > 0 else { return usableWidth }
-        return max(24, usableWidth * CGFloat(clip.outputDuration / editing.outputDuration))
+    private func syncTrimFields() {
+        guard let clip = editing.selectedClip else { return }
+        inputText = Timecode.format(clip.sourceRange.start); outputText = Timecode.format(clip.sourceRange.end)
     }
-
-    private func playheadX(contentWidth: CGFloat) -> CGFloat {
-        guard let location = editing.location(atOutputTime: playheadTime) else { return 0 }
-        var x = 0.0
-        for index in editing.clips.indices {
-            let clip = editing.clips[index]
-            let width = segmentWidth(for: clip, contentWidth: contentWidth)
-            if index == location.clipIndex {
-                let fraction = clip.outputDuration > 0
-                    ? location.localOutputTime / clip.outputDuration
-                    : 0
-                return min(contentWidth - 1, x + width * CGFloat(fraction))
-            }
-            x += width + segmentSpacing
+    private func applyTrim() {
+        guard let start = Timecode.parse(inputText), let end = Timecode.parse(outputText), editing.trimSelected(start: start, end: end) else {
+            trimError = "入点必须早于出点，且都位于该素材范围内"; return
         }
-        return min(contentWidth - 1, x)
+        trimError = nil; timelineWasEdited(); syncTrimFields()
+        if let id = editing.selectedClipID { scrub(to: editing.outputStart(of: id) ?? 0) }
     }
-
-    private func outputTime(forX requestedX: CGFloat, contentWidth: CGFloat) -> TimeInterval {
-        let x = min(max(0, requestedX), contentWidth)
-        var cursorX = 0.0
-        var cursorTime = 0.0
-
-        for clip in editing.clips {
-            let width = segmentWidth(for: clip, contentWidth: contentWidth)
-            if x <= cursorX + width {
-                let fraction = width > 0 ? (x - cursorX) / width : 0
-                return min(
-                    editing.outputDuration,
-                    cursorTime + clip.outputDuration * Double(max(0, fraction))
-                )
-            }
-            cursorX += width + segmentSpacing
-            cursorTime += clip.outputDuration
-        }
-        return editing.outputDuration
+    private func setEditPoint(_ start: Bool) {
+        guard let location = editing.location(atOutputTime: playerController.outputTime) else { return }
+        editing.selectedClipID = location.clipID
+        let clip = editing.clips[location.clipIndex]
+        guard editing.trimSelected(start: start ? location.sourceTime : clip.sourceRange.start, end: start ? clip.sourceRange.end : location.sourceTime) else { trimError = "此位置无法形成有效片段"; return }
+        trimError = nil; timelineWasEdited(); syncTrimFields()
+        let beginning = editing.outputStart(of: location.clipID) ?? 0
+        scrub(to: start ? beginning : beginning + editing.clips[location.clipIndex].outputDuration)
+    }
+    private func trimHandle(clip: EditSegment, start: Bool, pixelsPerSecond: Double) -> some View {
+        Capsule().fill(editing.selectedClipID == clip.id ? Color.accentColor : Color.white.opacity(0.5))
+            .frame(width: 7, height: 58).padding(.horizontal, 2)
+            .help(start ? "拖动修剪入点" : "拖动修剪出点")
+            .gesture(DragGesture(minimumDistance: 2).onChanged { _ in
+                if edgeDrag == nil { edgeDrag = (clip.id, start, clip.sourceRange); editing.selectedClipID = clip.id; playerController.pause() }
+            }.onEnded { value in
+                guard let edgeDrag else { return }; defer { self.edgeDrag = nil }
+                editing.selectedClipID = edgeDrag.0
+                let delta = Double(value.translation.width) / max(0.01, pixelsPerSecond) * clip.playbackRate
+                let range = edgeDrag.2, limit = clip.media?.duration ?? editing.sourceDuration
+                let newStart = start ? min(range.end - 0.04, max(0, range.start + delta)) : range.start
+                let newEnd = start ? range.end : min(limit, max(range.start + 0.04, range.end + delta))
+                if editing.trimSelected(start: newStart, end: newEnd) { timelineWasEdited(); syncTrimFields() }
+            })
     }
 
     private var canSplit: Bool {
@@ -354,17 +379,11 @@ struct ClipTimelineEditorView: View {
             && clip.outputDuration - location.localOutputTime > 0.04
     }
 
-    private func scrub(toX x: CGFloat, contentWidth: CGFloat) {
-        scrub(to: outputTime(forX: x, contentWidth: contentWidth))
-    }
-
     private func scrub(to outputTime: TimeInterval) {
         guard let location = editing.location(atOutputTime: outputTime) else { return }
-        playerController.pause()
         playheadTime = location.outputTime
         editing.selectedClipID = location.clipID
-        synchronizeSelectionPreview()
-        playerController.seek(to: location.sourceTime)
+        playerController.seekOutput(to: location.outputTime)
     }
 
     private func splitAtPlayhead() {
@@ -397,59 +416,12 @@ struct ClipTimelineEditorView: View {
 
     private func timelineWasEdited() {
         requiresTranscode()
+        playerController.updateTimeline(editing: editing)
     }
 
     private func clipTreatmentChanged() {
         requiresTranscode()
-        synchronizeSelectionPreview()
-    }
-
-    private func synchronizeSelectionPreview() {
-        guard let clip = editing.selectedClip else {
-            playerController.applyPreviewSettings(rate: 1, volume: 1)
-            return
-        }
-        playerController.applyPreviewSettings(
-            rate: clip.playbackRate,
-            volume: clip.volume
-        )
-    }
-
-    private func synchronizePlayhead(with sourceTime: TimeInterval) {
-        guard !isScrubbing,
-              let selectedIndex = editing.selectedClipIndex,
-              editing.clips.indices.contains(selectedIndex) else { return }
-        let clip = editing.clips[selectedIndex]
-        let tolerance = 1.0 / 30.0
-
-        if sourceTime >= clip.sourceRange.start - tolerance,
-           sourceTime <= clip.sourceRange.end + tolerance {
-            let localSourceTime = min(
-                clip.sourceRange.duration,
-                max(0, sourceTime - clip.sourceRange.start)
-            )
-            playheadTime = (editing.outputStart(of: clip.id) ?? 0)
-                + localSourceTime / max(0.1, clip.playbackRate)
-
-            if playerController.isPlaying,
-               sourceTime >= clip.sourceRange.end - tolerance {
-                advancePlayback(after: selectedIndex)
-            }
-        }
-    }
-
-    private func advancePlayback(after index: Int) {
-        let nextIndex = index + 1
-        guard editing.clips.indices.contains(nextIndex) else {
-            playerController.pause()
-            return
-        }
-        let next = editing.clips[nextIndex]
-        editing.selectedClipID = next.id
-        playheadTime = editing.outputStart(of: next.id) ?? playheadTime
-        synchronizeSelectionPreview()
-        playerController.seek(to: next.sourceRange.start)
-        playerController.play()
+        playerController.updateTimeline(editing: editing)
     }
 
     private func formatTime(_ seconds: TimeInterval) -> String {
@@ -502,7 +474,7 @@ private struct TimelineClipCell: View {
                     .contentShape(Rectangle())
                     .onDrag(dragProvider)
                     .help("拖动以移动片段")
-                Text("片段 \(number) · \(clip.outputDuration.formatted(.number.precision(.fractionLength(1)))) 秒")
+                Text("\(clip.sourceURL?.lastPathComponent ?? "片段 \(number)") · \(clip.outputDuration.formatted(.number.precision(.fractionLength(1)))) 秒")
                     .font(.caption2.weight(.semibold))
                     .lineLimit(1)
             }
@@ -532,24 +504,27 @@ private struct TimelineClipCell: View {
 }
 
 private struct TimelineRulerView: View {
-    let duration: TimeInterval
+    let layout: TimelineLayout
 
     var body: some View {
-        GeometryReader { proxy in
-            ForEach(0...5, id: \.self) { index in
-                let fraction = Double(index) / 5
-                let x = proxy.size.width * fraction
-                VStack(spacing: 1) {
+        let tickCount = max(5, Int(layout.contentWidth / 140))
+        ZStack(alignment: .topLeading) {
+            ForEach(0...tickCount, id: \.self) { index in
+                let x = layout.contentWidth * Double(index) / Double(tickCount)
+                ZStack(alignment: .topLeading) {
                     Rectangle()
                         .fill(Color.secondary.opacity(0.42))
                         .frame(width: 1, height: 4)
-                    Text(formatTime(duration * fraction))
+                        .offset(x: min(layout.contentWidth - 1, x))
+                    Text(formatTime(layout.time(atX: x)))
                         .font(.system(size: 8, design: .monospaced))
                         .foregroundStyle(.secondary)
+                        .frame(width: 56, alignment: index == 0 ? .leading : index == tickCount ? .trailing : .center)
+                        .offset(x: min(max(0, x - 28), max(0, layout.contentWidth - 56)), y: 6)
                 }
-                .position(x: min(max(20, x), proxy.size.width - 20), y: 8)
             }
         }
+        .frame(width: layout.contentWidth, height: 18, alignment: .topLeading)
     }
 
     private func formatTime(_ seconds: TimeInterval) -> String {

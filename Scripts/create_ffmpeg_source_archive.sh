@@ -38,7 +38,8 @@ for source_directory in \
     "$FREETYPE_SOURCE_DIR" \
     "$FRIBIDI_SOURCE_DIR" \
     "$HARFBUZZ_SOURCE_DIR" \
-    "$LIBUNIBREAK_SOURCE_DIR"; do
+    "$LIBUNIBREAK_SOURCE_DIR" \
+    "$ZIMG_SOURCE_DIR"; do
     ditto "$source_root/$source_directory" "$archive_root/Sources/$source_directory"
 done
 

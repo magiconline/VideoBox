@@ -60,9 +60,12 @@ printf '1\n00:00:00,000 --> 00:00:00,250\nVideoBox\n' \
     -f lavfi -i "color=size=160x96:rate=12:color=black" \
     -frames:v 2 -vf "subtitles=$temporary_directory/subtitle.srt" -f null -
 
+"$ffmpeg" -v error -f lavfi -i "testsrc2=size=160x96:rate=12" \
+    -frames:v 1 -vf "zscale=pin=bt2020:tin=smpte2084:min=bt2020nc:rin=limited:p=bt2020:m=gbr:r=full:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:peak=10,zscale=t=bt709:m=bt709:r=limited,format=yuv420p10le" -f null -
+
 for output in x264.mp4 x265.mp4 x265-10bit.mp4 av1.mkv opus.ogg; do
     "$ffprobe" -v error -show_entries format=duration \
         -of default=noprint_wrappers=1:nokey=1 "$temporary_directory/$output" >/dev/null
 done
 
-print "Verified x264, x265 (8/10-bit), AV1 encode/software decode, Opus, subtitle burn-in, and ffprobe"
+print "Verified x264, x265 (8/10-bit), AV1 encode/software decode, Opus, subtitle burn-in, HDR tone mapping with zimg, and ffprobe"

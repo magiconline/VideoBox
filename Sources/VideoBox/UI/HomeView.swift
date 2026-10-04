@@ -8,8 +8,9 @@ struct HomeView: View {
 
     @State private var selectedAsset: MediaAsset?
     @State private var mediaProbe: MediaProbe?
-    @State private var configuration = ExportConfiguration()
-    @State private var editing = EditSettings()
+    @StateObject private var session = ProjectSession()
+    private var configuration: ExportConfiguration { get { session.configuration } nonmutating set { session.configuration = newValue } }
+    private var editing: EditSettings { get { session.editing } nonmutating set { session.editing = newValue } }
     @State private var outputDirectoryURL: URL?
     @State private var outputFileName = ""
     @State private var isShowingImporter = false
@@ -18,6 +19,7 @@ struct HomeView: View {
     @State private var isLoadingVideo = false
     @State private var feedback: EditorFeedback?
     @State private var mediaLoadTask: Task<Void, Never>?
+    @State private var recoveryProject: VideoBoxProject?
 
     var body: some View {
         NavigationStack {
@@ -28,8 +30,8 @@ struct HomeView: View {
                         mediaProbe: mediaProbe,
                         isLoadingVideo: isLoadingVideo,
                         playerController: playerController,
-                        configuration: $configuration,
-                        editing: $editing,
+                        configuration: $session.configuration,
+                        editing: $session.editing,
                         outputDirectoryURL: outputDirectoryURL,
                         outputFileName: $outputFileName,
                         feedback: feedback,
@@ -51,11 +53,30 @@ struct HomeView: View {
                         isTargeted: $isDropTarget,
                         perform: acceptDrop
                     )
+                    .overlay(alignment: .bottom) {
+                        VStack {
+                            if let feedback { Text(feedback.message).foregroundStyle(feedback.color) }
+                            if let recoveryProject { Button("恢复上次编辑：\(recoveryProject.sourceURL.lastPathComponent)") { openProject(recoveryProject, fileURL: nil) } }
+                        }.padding(24)
+                    }
                 }
             }
             .background(Color(nsColor: .windowBackgroundColor))
             .navigationTitle("VideoBox")
             .toolbar {
+                ToolbarItemGroup {
+                    Button("打开工程", action: chooseProject).keyboardShortcut("o", modifiers: [.command, .shift])
+                    if selectedAsset != nil {
+                        Button("保存工程", action: saveProject).keyboardShortcut("s", modifiers: .command)
+                        Button { session.undo() } label: { Image(systemName: "arrow.uturn.backward") }
+                            .disabled(!session.canUndo).help("撤销（⌘Z）")
+                        Button { session.redo() } label: { Image(systemName: "arrow.uturn.forward") }
+                            .disabled(!session.canRedo).help("重做（⇧⌘Z）")
+                        Button("添加素材", action: appendMedia)
+                        Text(session.isDirty ? "未保存 · 自动恢复已开启" : (session.projectURL?.lastPathComponent ?? "未命名工程"))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 ToolbarItem(placement: .automatic) {
                     Button {
                         isShowingQueue = true
@@ -84,7 +105,19 @@ struct HomeView: View {
         }
         .task {
             await environment.refreshToolchain()
+            recoveryProject = session.recovery()
         }
+        .focusedSceneValue(\.projectActions, ProjectActions(session: session, open: chooseProject, save: saveProject,
+                                                           saveAs: { saveProject(asNew: true) }, appendMedia: appendMedia))
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in session.autosave(); environment.prepareForTermination() }
+        .onDisappear { session.autosave() }
+        .overlay(alignment: .bottomLeading) { if let error = session.persistenceError { Text(error).font(.caption).foregroundStyle(.red).padding(8).background(.bar) } }
+        .onOpenURL { url in
+            if url.pathExtension == "vboxproject" { readProject(url) } else { openVideo(url) }
+        }
+        .onChange(of: outputDirectoryURL) { value in session.outputDirectoryURL = value; session.autosave() }
+        .onChange(of: outputFileName) { value in session.outputFileName = value; session.autosave() }
+        .onChange(of: playerController.outputTime) { value in session.playhead = value }
         .onDisappear {
             mediaLoadTask?.cancel()
             playerController.pause()
@@ -133,6 +166,8 @@ struct HomeView: View {
     }
 
     private func openVideo(_ url: URL) {
+        session.autosave()
+        session.sourceURL = nil
         mediaLoadTask?.cancel()
         let asset = MediaAsset(url: url)
         selectedAsset = asset
@@ -174,6 +209,8 @@ struct HomeView: View {
                 configuration.metadataEntries = probe.metadata
                     .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
                     .map { MetadataExportEntry(key: $0.key, value: $0.value) }
+                session.begin(VideoBoxProject(sourceURL: url, editing: editing, configuration: configuration,
+                    outputDirectoryURL: outputDirectoryURL, outputFileName: outputFileName))
                 if !(await MediaPlaybackCompatibility.isPlayableVideo(at: url)) {
                     var selection = TrackPreviewSelection()
                     selection.normalize(using: trackSettings)
@@ -210,6 +247,8 @@ struct HomeView: View {
     }
 
     private func closeVideo() {
+        session.autosave()
+        recoveryProject = session.recovery()
         mediaLoadTask?.cancel()
         mediaLoadTask = nil
         playerController.clear()
@@ -218,6 +257,110 @@ struct HomeView: View {
         isLoadingVideo = false
         feedback = nil
         outputDirectoryURL = nil
+        session.sourceURL = nil
+    }
+
+    private func chooseProject() {
+        let panel = NSOpenPanel(); panel.title = "打开 VideoBox 工程"; panel.allowedFileTypes = ["vboxproject"]
+        if panel.runModal() == .OK, let url = panel.url { readProject(url) }
+    }
+
+    private func readProject(_ url: URL) {
+        do { openProject(try VideoBoxProject.read(url), fileURL: url) }
+        catch { feedback = .error("工程打开失败：\(error.localizedDescription)") }
+    }
+
+    private func openProject(_ project: VideoBoxProject, fileURL: URL?) {
+        var project = project
+        for missing in project.referencedURLs where !FileManager.default.isReadableFile(atPath: missing.path) {
+            let panel = NSOpenPanel(); panel.title = "重新定位：\(missing.lastPathComponent)"; panel.prompt = "使用此文件"
+            guard panel.runModal() == .OK, let replacement = panel.url else { return }
+            if project.sourceURL == missing { project.sourceURL = replacement }
+            for i in project.editing.clips.indices where project.editing.clips[i].sourceURL == missing { project.editing.clips[i].sourceURL = replacement }
+            for i in project.editing.overlayClips.indices where project.editing.overlayClips[i].sourceURL == missing { project.editing.overlayClips[i].sourceURL = replacement }
+            for i in project.configuration.trackSettings.indices where project.configuration.trackSettings[i].sourceURL == missing { project.configuration.trackSettings[i].sourceURL = replacement }
+            if project.configuration.color.lutFile?.url == missing { project.configuration.color.lutFile = LUTFileReference(url: replacement) }
+        }
+        session.autosave(); mediaLoadTask?.cancel()
+        session.begin(project, fileURL: fileURL)
+        selectedAsset = MediaAsset(url: project.sourceURL); mediaProbe = nil; isLoadingVideo = true
+        outputDirectoryURL = project.outputDirectoryURL ?? project.sourceURL.deletingLastPathComponent()
+        outputFileName = project.outputFileName; feedback = nil
+        playerController.load(url: project.sourceURL)
+        mediaLoadTask = Task { @MainActor in
+            do {
+                let probe = try await environment.probeMedia(at: project.sourceURL)
+                guard !Task.isCancelled, selectedAsset?.url == project.sourceURL else { return }
+                mediaProbe = probe
+                var refreshed = editing; refreshed.sourceDuration = probe.duration ?? refreshed.sourceDuration
+                var probes: [URL: MediaProbe] = [project.sourceURL: probe]
+                for url in Set(refreshed.referencedURLs) {
+                    probes[url] = try await environment.probeMedia(at: url)
+                    guard !Task.isCancelled, selectedAsset?.url == project.sourceURL else { return }
+                }
+                for index in refreshed.clips.indices {
+                    if let url = refreshed.clips[index].sourceURL, let info = probes[url] { refreshed.clips[index].media = ClipMedia(info) }
+                }
+                for index in refreshed.overlayClips.indices {
+                    if let info = probes[refreshed.overlayClips[index].sourceURL] { refreshed.overlayClips[index].media = ClipMedia(info) }
+                }
+                var restored = project; restored.editing = refreshed
+                for index in restored.configuration.trackSettings.indices {
+                    let track = restored.configuration.trackSettings[index], url = track.resolvedSourceURL(primarySourceURL: project.sourceURL)
+                    if let info = probes[url], let stream = info.streams.first(where: { $0.index == track.streamIndex && $0.kind == track.kind }) {
+                        restored.configuration.trackSettings[index].sourceStream = stream; restored.configuration.trackSettings[index].sourceDuration = info.duration
+                    }
+                }
+                session.begin(restored, fileURL: fileURL)
+                if !refreshed.requiresRenderedPreview, !(await MediaPlaybackCompatibility.isPlayableVideo(at: project.sourceURL)) {
+                    var selection = TrackPreviewSelection(); selection.normalize(using: restored.configuration.trackSettings)
+                    let preview = try await environment.createTrackPreview(primarySourceURL: project.sourceURL, tracks: selection.selectedTracks(from: restored.configuration.trackSettings), duration: probe.duration, subtitleOffset: restored.configuration.subtitles.timeOffsetSeconds)
+                    guard !Task.isCancelled, selectedAsset?.url == project.sourceURL else {
+                        try? FileManager.default.removeItem(at: preview.mediaURL)
+                        if let subtitle = preview.subtitleURL { try? FileManager.default.removeItem(at: subtitle) }; return
+                    }
+                    try playerController.loadTrackPreview(mediaURL: preview.mediaURL, subtitleURL: preview.subtitleURL, preservingTime: true, resumesPlayback: false)
+                }
+                playerController.updateTimeline(editing: editing); playerController.seekOutput(to: project.playhead)
+                isLoadingVideo = false
+            } catch is CancellationError { return }
+            catch { guard selectedAsset?.url == project.sourceURL else { return }; isLoadingVideo = false; feedback = .error("工程素材加载失败：\(error.localizedDescription)") }
+        }
+    }
+
+    private func saveProject() { saveProject(asNew: false) }
+    private func saveProject(asNew: Bool) {
+        guard selectedAsset != nil else { return }
+        var url = asNew ? nil : session.projectURL
+        if url == nil {
+            let panel = NSSavePanel(); panel.title = "保存 VideoBox 工程"; panel.allowedFileTypes = ["vboxproject"]
+            panel.nameFieldStringValue = "\(selectedAsset!.url.deletingPathExtension().lastPathComponent).vboxproject"
+            guard panel.runModal() == .OK else { return }; url = panel.url
+        }
+        do { try session.save(to: url!); feedback = .success("工程已保存") }
+        catch { feedback = .error(error.localizedDescription) }
+    }
+
+    private func appendMedia() {
+        guard selectedAsset != nil else { return }
+        let panel = NSOpenPanel(); panel.title = "添加时间线素材"; panel.allowsMultipleSelection = true; panel.allowedContentTypes = allowedContentTypes
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        let source = selectedAsset?.url
+        mediaLoadTask?.cancel()
+        mediaLoadTask = Task { @MainActor in
+            for url in urls {
+                do {
+                    let probe = try await environment.probeMedia(at: url)
+                    guard !Task.isCancelled, selectedAsset?.url == source else { return }
+                    guard let duration = probe.duration, duration > 0, probe.primaryVideoStream != nil else { feedback = .error("此文件没有可用的视频画面"); continue }
+                    var clip = EditSegment(sourceRange: TimelineRange(start: 0, duration: duration))
+                    clip.sourceURL = url; clip.media = ClipMedia(probe)
+                    editing.clips.append(clip); editing.selectedClipID = clip.id
+                    configuration.mode = .transcode
+                } catch { feedback = .error("素材读取失败：\(error.localizedDescription)") }
+            }
+        }
     }
 
     private func chooseOutputFolder() {
@@ -234,18 +377,19 @@ struct HomeView: View {
         }
     }
 
-    private func enqueueExport() {
+    private func enqueueExport(mode: ExportMode) {
         guard let selectedAsset, let outputDirectoryURL else { return }
         guard isFFmpegAvailable else {
             feedback = .error("未检测到 FFmpeg，当前无法导出。")
             return
         }
-        if let validationMessage = validateTrackExport(
-            primarySourceURL: selectedAsset.url,
-            configuration: configuration,
-            editing: editing
-        ) {
-            feedback = .error(validationMessage)
+        var exportConfiguration = configuration
+        exportConfiguration.mode = mode
+
+        let plan = ExportPlan(configuration: exportConfiguration, editing: editing, sourceVideo: mediaProbe?.primaryVideoStream, primarySourceURL: selectedAsset.url)
+        let blockers = plan.blockers + ExportPlan.fileBlockers(configuration: exportConfiguration, primarySourceURL: selectedAsset.url)
+        if !blockers.isEmpty {
+            feedback = .error("\(mode.displayName)不可用：\(blockers.joined(separator: "、"))")
             return
         }
 
@@ -260,10 +404,10 @@ struct HomeView: View {
 
         let destinationURL = outputDirectoryURL
             .appendingPathComponent(sanitizedName)
-            .appendingPathExtension(configuration.container.fileExtension)
+            .appendingPathExtension(exportConfiguration.container.fileExtension)
 
         if FileManager.default.fileExists(atPath: destinationURL.path),
-           !configuration.advanced.overwriteExisting {
+           !exportConfiguration.advanced.overwriteExisting {
             feedback = .error("同名文件已存在，请修改文件名或启用覆盖。")
             return
         }
@@ -272,75 +416,20 @@ struct HomeView: View {
             sourceURL: selectedAsset.url,
             destinationURL: destinationURL,
             sourceDuration: mediaProbe?.duration,
-            configuration: configuration,
+            sourceVideo: mediaProbe?.primaryVideoStream,
+            configuration: exportConfiguration,
             editing: editing
         )
+        let destinationBlockers = ExportPlan.destinationBlockers(request: request)
+        if !destinationBlockers.isEmpty {
+            feedback = .error(destinationBlockers.joined(separator: "、"))
+            return
+        }
         environment.enqueueExport(request)
+        configuration.mode = mode
         feedback = .success("已开始导出：\(destinationURL.lastPathComponent)")
     }
 
-    private func validateTrackExport(
-        primarySourceURL: URL,
-        configuration: ExportConfiguration,
-        editing: EditSettings
-    ) -> String? {
-        guard !configuration.trackSettings.isEmpty else { return nil }
-        let includedTracks = configuration.trackSettings.filter(\.isIncluded)
-        guard includedTracks.contains(where: { $0.kind == .video }) else {
-            return "成片导出至少需要启用一条视频轨道。"
-        }
-
-        let usedTracks = includedTracks.filter {
-            !($0.kind == .subtitle
-                && (configuration.subtitles.mode == .remove || configuration.subtitles.mode == .burn))
-        }
-        if let missingTrack = usedTracks.first(where: {
-            !FileManager.default.fileExists(
-                atPath: $0.resolvedSourceURL(primarySourceURL: primarySourceURL).path
-            )
-        }) {
-            let sourceURL = missingTrack.resolvedSourceURL(primarySourceURL: primarySourceURL)
-            return "轨道源文件已不可用：\(sourceURL.lastPathComponent)"
-        }
-
-        if editing.requiresFilterComposition {
-            let videoCount = includedTracks.filter { $0.kind == .video }.count
-            if videoCount > 1 {
-                return "片段剪切、重排或变速时只能保留一条视频轨道；请关闭其他视频轨道后再导出。"
-            }
-            if includedTracks.contains(where: { $0.kind == .subtitle }),
-               configuration.subtitles.mode == .copy || configuration.subtitles.mode == .convert {
-                return "片段剪切、重排或变速后无法直接保留软字幕；请选择烧录字幕或移除字幕。"
-            }
-        }
-
-        guard configuration.mode == .streamCopy else { return nil }
-        let codecsByKind: (MediaStreamKind) -> [String] = { kind in
-            includedTracks
-                .filter { $0.kind == kind }
-                .compactMap { $0.codecName?.lowercased() }
-        }
-
-        if configuration.container == .mp4 || configuration.container == .mov {
-            let unsupportedSubtitles = codecsByKind(.subtitle).filter { $0 != "mov_text" }
-            if !unsupportedSubtitles.isEmpty, configuration.subtitles.mode == .copy {
-                return "当前字幕编码不适合 \(configuration.container.displayName)，请将字幕处理方式改为“转换为容器兼容格式”。"
-            }
-        }
-        if configuration.container == .webm {
-            let supportedVideo = Set(["vp8", "vp9", "av1"])
-            let supportedAudio = Set(["opus", "vorbis"])
-            if codecsByKind(.video).contains(where: { !supportedVideo.contains($0) })
-                || codecsByKind(.audio).contains(where: { !supportedAudio.contains($0) }) {
-                return "WebM 无法直接容纳当前启用的编码；请选择压缩导出、更换容器或关闭不兼容轨道。"
-            }
-            if includedTracks.contains(where: { $0.kind == .subtitle }),
-               configuration.subtitles.mode == .copy {
-                return "WebM 字幕需要转换为 WebVTT，请将字幕处理方式设为转换。"
-            }
-        }
-        return nil
-    }
 }
 
 enum EditorFeedback: Equatable {

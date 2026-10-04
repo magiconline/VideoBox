@@ -12,13 +12,25 @@ final class AppEnvironment: ObservableObject {
     private let previewSessionDirectoryURL: URL
     private var hasInspectedToolchain = false
     private var queueWorker: Task<Void, Never>?
+    private var activeExport: (id: UUID, task: Task<URL, Error>)?
+    private let exportOperation: ExportOperation?
+    private var activeControl: ProcessControl?
+    private var isTerminating = false
+
+    typealias ExportOperation = @Sendable (
+        ExportRequest,
+        @escaping @Sendable (Double) -> Void
+    ) async throws -> URL
 
     init(
         jobQueue: JobQueue? = nil,
-        toolchainInspector: ToolchainInspector = ToolchainInspector()
+        toolchainInspector: ToolchainInspector = ToolchainInspector(),
+        exportOperation: ExportOperation? = nil,
+        persistsQueue: Bool = false
     ) {
-        self.jobQueue = jobQueue ?? JobQueue()
+        self.jobQueue = jobQueue ?? JobQueue(persistenceURL: persistsQueue ? ProjectSession.applicationDirectory.appendingPathComponent("Queue.json") : nil)
         self.toolchainInspector = toolchainInspector
+        self.exportOperation = exportOperation
         let previewRootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("VideoBox-TrackPreviews", isDirectory: true)
         self.previewSessionDirectoryURL = previewRootURL
@@ -30,6 +42,16 @@ final class AppEnvironment: ObservableObject {
             in: previewRootURL,
             activeProcessIdentifier: ProcessInfo.processInfo.processIdentifier
         )
+        self.jobQueue.onCancel = { [weak self] id in
+            guard let self, self.activeExport?.id == id else { return }
+            self.activeControl?.setPaused(false)
+            self.activeExport?.task.cancel()
+        }
+        self.jobQueue.onPause = { [weak self] id, paused in
+            guard let self, self.activeExport?.id == id else { return }
+            self.activeControl?.setPaused(paused)
+        }
+        self.jobQueue.onStart = { [weak self] in self?.startQueueWorkerIfNeeded() }
     }
 
     func refreshToolchain(force: Bool = false) async {
@@ -38,12 +60,30 @@ final class AppEnvironment: ObservableObject {
         toolchainReport = await toolchainInspector.inspect()
     }
 
+    func prepareForTermination() {
+        isTerminating = true
+        if let id = activeExport?.id { jobQueue.pause(id: id) }
+        activeControl?.terminate(); activeExport?.task.cancel()
+    }
+
     func probeMedia(at url: URL) async throws -> MediaProbe {
         await refreshToolchain()
         guard let executableURL = toolchainReport.executableURL(for: .ffprobe) else {
             throw AppEnvironmentError.missingTool("ffprobe")
         }
         return try await FFprobeEngine(executableURL: executableURL).probe(url)
+    }
+
+    func scanKeyframes(url: URL, streamIndex: Int, duration: Double) async throws -> QuickTrimIndex {
+        await refreshToolchain()
+        guard let ffprobe = toolchainReport.executableURL(for: .ffprobe) else { throw AppEnvironmentError.missingTool("ffprobe") }
+        return try await QuickTrimIndex.scan(url: url, streamIndex: streamIndex, duration: duration, ffprobe: ffprobe)
+    }
+
+    func renderExportPreview(_ request: ExportRequest, onProgress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        await refreshToolchain()
+        guard let ffmpeg = toolchainReport.executableURL(for: .ffmpeg) else { throw AppEnvironmentError.missingTool("FFmpeg") }
+        return try await FFmpegExportEngine(executableURL: ffmpeg).export(request, onProgress: onProgress)
     }
 
     @discardableResult
@@ -139,33 +179,71 @@ final class AppEnvironment: ObservableObject {
             guard let self else { return }
             defer { queueWorker = nil }
 
+            if exportOperation == nil {
+                await refreshToolchain()
+            }
+
             while let job = nextQueuedJob {
-                guard let executableURL = toolchainReport.executableURL(for: .ffmpeg) else {
-                    jobQueue.update(id: job.id, state: .failed(message: "未检测到 FFmpeg"))
-                    continue
-                }
-
-                jobQueue.update(id: job.id, state: .running(progress: 0))
-
-                do {
-                    let outputURL = try await FFmpegExportEngine(
-                        executableURL: executableURL
-                    ).export(job.request.exportRequest)
-                    guard !isCancelledOrRemoved(job.id) else { continue }
-                    jobQueue.update(id: job.id, state: .completed(outputURL: outputURL))
-                } catch {
-                    guard !isCancelledOrRemoved(job.id) else { continue }
-                    jobQueue.update(
-                        id: job.id,
-                        state: .failed(message: error.localizedDescription)
-                    )
-                }
+                await execute(job)
             }
         }
     }
 
+    private func execute(_ job: MediaJob) async {
+        let operation: ExportOperation
+        if let exportOperation {
+            operation = exportOperation
+        } else if let executableURL = toolchainReport.executableURL(for: .ffmpeg) {
+            let control = ProcessControl()
+            activeControl = control
+            operation = { request, onProgress in
+                try await FFmpegExportEngine(executableURL: executableURL, runner: ProcessRunner(control: control))
+                    .export(request, onProgress: onProgress)
+            }
+        } else {
+            jobQueue.update(id: job.id, state: .failed(message: "未检测到 FFmpeg"))
+            return
+        }
+
+        jobQueue.update(id: job.id, state: .running(progress: 0))
+        let task = Task {
+            try await operation(job.request.exportRequest) { [weak self] progress in
+                Task { @MainActor [weak self] in
+                    self?.jobQueue.updateProgress(id: job.id, progress: progress)
+                }
+            }
+        }
+        activeExport = (job.id, task)
+        defer { activeExport = nil; activeControl = nil }
+
+        do {
+            let outputURL = try await task.value
+            guard !isTerminating else { return }
+            guard !isCancelledOrRemoved(job.id) else {
+                finishCancellation(job.id)
+                return
+            }
+            jobQueue.update(id: job.id, state: .completed(outputURL: outputURL))
+        } catch is CancellationError {
+            guard !isTerminating else { return }
+            finishCancellation(job.id)
+        } catch {
+            guard !isTerminating else { return }
+            guard !isCancelledOrRemoved(job.id) else {
+                finishCancellation(job.id)
+                return
+            }
+            jobQueue.update(id: job.id, state: .failed(message: error.localizedDescription))
+        }
+    }
+
+    private func finishCancellation(_ id: UUID) {
+        jobQueue.update(id: id, state: .cancelled)
+    }
+
     private var nextQueuedJob: MediaJob? {
-        jobQueue.jobs.first {
+        guard !isTerminating else { return nil }
+        return jobQueue.jobs.first {
             if case .queued = $0.state { return true }
             return false
         }
@@ -173,8 +251,10 @@ final class AppEnvironment: ObservableObject {
 
     private func isCancelledOrRemoved(_ id: UUID) -> Bool {
         guard let job = jobQueue.jobs.first(where: { $0.id == id }) else { return true }
-        if case .cancelled = job.state { return true }
-        return false
+        return switch job.state {
+        case .cancelled, .cancelling: true
+        default: false
+        }
     }
 
     private static func removeAbandonedPreviewItems(

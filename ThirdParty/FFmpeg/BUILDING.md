@@ -6,7 +6,7 @@ The bundled media runtime is built from the unmodified upstream source trees in 
 
 - macOS 13 or later
 - Current Xcode Command Line Tools or Xcode
-- CMake, Meson, Ninja, NASM, and pkg-config (`brew install cmake meson ninja nasm pkgconf`)
+- CMake, Meson, Ninja, NASM, pkg-config and GNU autotools (`brew install cmake meson ninja nasm pkgconf autoconf automake libtool`)
 
 ## Build
 
@@ -32,6 +32,7 @@ The significant FFmpeg configuration choices are:
 --enable-libdav1d
 --enable-libopus
 --enable-libass
+--enable-libzimg
 --enable-static
 --disable-shared
 --disable-autodetect

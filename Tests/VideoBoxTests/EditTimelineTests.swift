@@ -72,6 +72,6 @@ final class EditTimelineTests: XCTestCase {
         )
 
         XCTAssertEqual(stream.bitDepth, 10)
-        XCTAssertEqual(stream.hdrDescription, "HDR10 / PQ")
+        XCTAssertEqual(stream.hdrDescription, "PQ（静态 HDR 信息未标记）")
     }
 }

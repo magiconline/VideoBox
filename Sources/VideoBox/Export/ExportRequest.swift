@@ -4,14 +4,17 @@ struct ExportRequest: Codable, Equatable, Sendable {
     var sourceURL: URL
     var destinationURL: URL
     var sourceDuration: TimeInterval?
+    var sourceVideo: MediaStream?
     var configuration: ExportConfiguration
     var editing: EditSettings
     var operation: ExportOperation
+    var previewOutputRange: TimelineRange?
 
     init(
         sourceURL: URL,
         destinationURL: URL,
         sourceDuration: TimeInterval? = nil,
+        sourceVideo: MediaStream? = nil,
         configuration: ExportConfiguration,
         editing: EditSettings,
         operation: ExportOperation = .media
@@ -19,6 +22,7 @@ struct ExportRequest: Codable, Equatable, Sendable {
         self.sourceURL = sourceURL
         self.destinationURL = destinationURL
         self.sourceDuration = sourceDuration
+        self.sourceVideo = sourceVideo
         self.configuration = configuration
         self.editing = editing
         self.operation = operation
@@ -38,11 +42,13 @@ struct ExportConfiguration: Codable, Equatable, Sendable {
     var includeDataStreams = false
     var trackSettings: [TrackExportSettings] = []
     var metadataEntries: [MetadataExportEntry] = []
+    var color = ColorExportSettings()
     var video = VideoExportSettings()
     var audio = AudioExportSettings()
     var subtitles = SubtitleExportSettings()
     var containerOptions = ContainerExportSettings()
     var advanced = AdvancedExportSettings()
+    var copyTrimIndex: QuickTrimIndex?
 }
 
 struct TrackExportSettings: Codable, Equatable, Identifiable, Sendable {
@@ -59,6 +65,7 @@ struct TrackExportSettings: Codable, Equatable, Identifiable, Sendable {
     var sampleRate: Int?
     var channels: Int?
     var sourceDuration: TimeInterval?
+    var sourceStream: MediaStream?
 
     var id: String {
         let sourceIdentity = sourceURL?.standardizedFileURL.path ?? "__primary__"
@@ -93,6 +100,7 @@ struct TrackExportSettings: Codable, Equatable, Identifiable, Sendable {
         self.sampleRate = sampleRate
         self.channels = channels
         self.sourceDuration = sourceDuration
+        self.sourceStream = nil
     }
 
     init(sourceURL: URL, stream: MediaStream, sourceDuration: TimeInterval?) {
@@ -110,6 +118,7 @@ struct TrackExportSettings: Codable, Equatable, Identifiable, Sendable {
             channels: stream.channels,
             sourceDuration: sourceDuration
         )
+        self.sourceStream = stream
     }
 
     func resolvedSourceURL(primarySourceURL: URL) -> URL {
@@ -383,6 +392,18 @@ enum EncoderPreset: String, Codable, CaseIterable, Hashable, Sendable {
     case slow
     case veryslow
 
+    func ffmpegValue(for codec: VideoCodec) -> String {
+        guard codec == .av1 else { return rawValue }
+        switch self {
+        case .ultrafast: return "12"
+        case .veryfast: return "10"
+        case .fast: return "8"
+        case .medium: return "6"
+        case .slow: return "4"
+        case .veryslow: return "2"
+        }
+    }
+
     var displayName: String {
         switch self {
         case .ultrafast: "最快"
@@ -539,22 +560,64 @@ enum FrameRatePreset: String, Codable, CaseIterable, Hashable, Sendable {
 enum PixelFormat: String, Codable, CaseIterable, Hashable, Sendable {
     case automatic
     case yuv420p
+    case yuv422p
+    case yuv444p
     case yuv420p10le
     case yuv422p10le
     case yuv444p10le
+    case yuv420p12le
+    case yuv422p12le
+    case yuv444p12le
 
     var displayName: String {
         switch self {
         case .automatic: "自动"
         case .yuv420p: "8-bit 4:2:0"
+        case .yuv422p: "8-bit 4:2:2"
+        case .yuv444p: "8-bit 4:4:4"
         case .yuv420p10le: "10-bit 4:2:0"
         case .yuv422p10le: "10-bit 4:2:2"
         case .yuv444p10le: "10-bit 4:4:4"
+        case .yuv420p12le: "12-bit 4:2:0"
+        case .yuv422p12le: "12-bit 4:2:2"
+        case .yuv444p12le: "12-bit 4:4:4"
         }
     }
 
     var ffmpegValue: String? {
         self == .automatic ? nil : rawValue
+    }
+
+    var bitDepth: Int? {
+        switch self {
+        case .automatic: nil
+        case .yuv420p, .yuv422p, .yuv444p: 8
+        case .yuv420p10le, .yuv422p10le, .yuv444p10le: 10
+        case .yuv420p12le, .yuv422p12le, .yuv444p12le: 12
+        }
+    }
+
+    var chromaSubsampling: ChromaSubsampling? {
+        switch self {
+        case .automatic: nil
+        case .yuv420p, .yuv420p10le, .yuv420p12le: .fourTwoZero
+        case .yuv422p, .yuv422p10le, .yuv422p12le: .fourTwoTwo
+        case .yuv444p, .yuv444p10le, .yuv444p12le: .fourFourFour
+        }
+    }
+
+    static func make(bitDepth: OutputBitDepth, chroma: ChromaSubsampling) -> PixelFormat {
+        switch (bitDepth, chroma) {
+        case (.eight, .fourTwoZero): .yuv420p
+        case (.eight, .fourTwoTwo): .yuv422p
+        case (.eight, .fourFourFour): .yuv444p
+        case (.ten, .fourTwoZero): .yuv420p10le
+        case (.ten, .fourTwoTwo): .yuv422p10le
+        case (.ten, .fourFourFour): .yuv444p10le
+        case (.twelve, .fourTwoZero): .yuv420p12le
+        case (.twelve, .fourTwoTwo): .yuv422p12le
+        case (.twelve, .fourFourFour): .yuv444p12le
+        }
     }
 }
 

@@ -16,7 +16,8 @@ let package = Package(
             path: "Sources/VideoBox",
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
-                .linkedFramework("AVKit")
+                .linkedFramework("AVKit"),
+                .linkedFramework("CoreImage")
             ]
         ),
         .testTarget(

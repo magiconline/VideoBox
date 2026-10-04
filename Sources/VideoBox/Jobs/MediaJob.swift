@@ -48,7 +48,9 @@ struct MediaJob: Identifiable, Codable, Equatable, Sendable {
 
 enum MediaJobState: Codable, Equatable, Sendable {
     case queued
-    case running(progress: Double)
+    case running(progress: Double?)
+    case cancelling
+    case paused(progress: Double?)
     case completed(outputURL: URL?)
     case failed(message: String)
     case cancelled
@@ -56,14 +58,16 @@ enum MediaJobState: Codable, Equatable, Sendable {
     var isTerminal: Bool {
         switch self {
         case .completed, .failed, .cancelled: true
-        case .queued, .running: false
+        case .queued, .running, .cancelling, .paused: false
         }
     }
 
     var displayName: String {
         switch self {
         case .queued: "等待中"
-        case let .running(progress): "处理中 \(Int(progress * 100))%"
+        case let .running(progress): progress.map { "处理中 \(Int($0 * 100))%" } ?? "处理中"
+        case .cancelling: "正在取消…"
+        case .paused: "已暂停"
         case .completed: "已完成"
         case .failed: "失败"
         case .cancelled: "已取消"

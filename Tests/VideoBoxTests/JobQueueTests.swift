@@ -31,6 +31,22 @@ final class JobQueueTests: XCTestCase {
         XCTAssertEqual(queue.jobs.first?.request.exportMode, .streamCopy)
     }
 
+    @MainActor
+    func testLateProgressDoesNotReviveCancellingOrCompletedJob() {
+        let queue = JobQueue()
+        queue.onCancel = { _ in }
+        let id = queue.enqueue(makeRequest(mode: .transcode))
+        queue.update(id: id, state: .running(progress: nil))
+        queue.updateProgress(id: id, progress: 0.4)
+        XCTAssertEqual(queue.jobs.first?.state, .running(progress: 0.4))
+        queue.cancel(id: id)
+        queue.updateProgress(id: id, progress: 0.8)
+        XCTAssertEqual(queue.jobs.first?.state, .cancelling)
+        queue.update(id: id, state: .completed(outputURL: nil))
+        queue.updateProgress(id: id, progress: 0.9)
+        XCTAssertEqual(queue.jobs.first?.state, .completed(outputURL: nil))
+    }
+
     private func makeRequest(
         mode: ExportMode,
         outputName: String = "output.mp4"

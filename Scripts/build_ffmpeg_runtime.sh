@@ -45,7 +45,7 @@ else
 fi
 runtime_root="$build_root/$runtime_architecture_label"
 
-for required_tool in curl shasum tar make cmake meson ninja nasm pkg-config xcrun lipo libtool otool; do
+for required_tool in curl shasum tar make cmake meson ninja nasm pkg-config xcrun lipo libtool otool autoreconf automake glibtoolize; do
     if ! command -v "$required_tool" >/dev/null 2>&1; then
         print -u2 "Missing FFmpeg build tool: $required_tool"
         print -u2 "Install local build prerequisites with: brew install cmake meson ninja nasm pkgconf"
@@ -110,6 +110,7 @@ source_directories=(
     "$FRIBIDI_SOURCE_DIR"
     "$HARFBUZZ_SOURCE_DIR"
     "$LIBUNIBREAK_SOURCE_DIR"
+    "$ZIMG_SOURCE_DIR"
 )
 
 if [[ -z "$provided_source_root" ]]; then
@@ -124,6 +125,7 @@ if [[ -z "$provided_source_root" ]]; then
     download_source "$FRIBIDI_ARCHIVE" "$FRIBIDI_URL" "$FRIBIDI_SHA256"
     download_source "$HARFBUZZ_ARCHIVE" "$HARFBUZZ_URL" "$HARFBUZZ_SHA256"
     download_source "$LIBUNIBREAK_ARCHIVE" "$LIBUNIBREAK_URL" "$LIBUNIBREAK_SHA256"
+    download_source "$ZIMG_ARCHIVE" "$ZIMG_URL" "$ZIMG_SHA256"
 
     extract_source "$FFMPEG_ARCHIVE" "$FFMPEG_SOURCE_DIR"
     extract_source "$X264_ARCHIVE" "$X264_SOURCE_DIR"
@@ -136,6 +138,7 @@ if [[ -z "$provided_source_root" ]]; then
     extract_source "$FRIBIDI_ARCHIVE" "$FRIBIDI_SOURCE_DIR"
     extract_source "$HARFBUZZ_ARCHIVE" "$HARFBUZZ_SOURCE_DIR"
     extract_source "$LIBUNIBREAK_ARCHIVE" "$LIBUNIBREAK_SOURCE_DIR"
+    extract_source "$ZIMG_ARCHIVE" "$ZIMG_SOURCE_DIR"
 else
     for source_directory in "${source_directories[@]}"; do
         if [[ ! -d "$source_root/$source_directory" ]]; then
@@ -486,7 +489,19 @@ build_architecture() {
             touch "$stamp_dir/x265-$X265_VERSION"
         fi
 
-        if [[ ! -f "$stamp_dir/ffmpeg-$FFMPEG_VERSION-dav1d-$DAV1D_VERSION" ]]; then
+        if [[ ! -f "$stamp_dir/zimg-$ZIMG_VERSION" ]]; then
+            local zimg_build="$architecture_build_dir/zimg-$ZIMG_VERSION"
+            mkdir -p "$zimg_build"
+            (cd "$source_root/$ZIMG_SOURCE_DIR" && ./autogen.sh)
+            cd "$zimg_build"
+            "$source_root/$ZIMG_SOURCE_DIR/configure" \
+                --prefix="$prefix" --host="$host" --enable-static --disable-shared
+            make -j "$build_jobs"
+            make install
+            touch "$stamp_dir/zimg-$ZIMG_VERSION"
+        fi
+
+        if [[ ! -f "$stamp_dir/ffmpeg-$FFMPEG_VERSION-dav1d-$DAV1D_VERSION-zimg-$ZIMG_VERSION" ]]; then
             local ffmpeg_build="$architecture_build_dir/ffmpeg"
             rm -rf "$ffmpeg_build"
             mkdir -p "$ffmpeg_build"
@@ -527,10 +542,11 @@ build_architecture() {
                 --enable-libopus \
                 --enable-libsvtav1 \
                 --enable-libx264 \
+                --enable-libzimg \
                 --enable-libx265
             make -j "$build_jobs"
             make install
-            touch "$stamp_dir/ffmpeg-$FFMPEG_VERSION-dav1d-$DAV1D_VERSION"
+            touch "$stamp_dir/ffmpeg-$FFMPEG_VERSION-dav1d-$DAV1D_VERSION-zimg-$ZIMG_VERSION"
         fi
     )
 }
@@ -578,6 +594,7 @@ ditto "$source_root/$FREETYPE_SOURCE_DIR/docs/GPLv2.TXT" "$staging_root/licenses
 ditto "$source_root/$FRIBIDI_SOURCE_DIR/COPYING" "$staging_root/licenses/FriBidi-COPYING.txt"
 ditto "$source_root/$HARFBUZZ_SOURCE_DIR/COPYING" "$staging_root/licenses/HarfBuzz-COPYING.txt"
 ditto "$source_root/$LIBUNIBREAK_SOURCE_DIR/LICENCE" "$staging_root/licenses/libunibreak-LICENCE.txt"
+ditto "$source_root/$ZIMG_SOURCE_DIR/COPYING" "$staging_root/licenses/zimg-COPYING.txt"
 
 {
     print "VideoBox bundled FFmpeg runtime"
@@ -592,6 +609,7 @@ ditto "$source_root/$LIBUNIBREAK_SOURCE_DIR/LICENCE" "$staging_root/licenses/lib
     print "FriBidi $FRIBIDI_VERSION"
     print "HarfBuzz $HARFBUZZ_VERSION"
     print "libunibreak $LIBUNIBREAK_VERSION"
+    print "zimg $ZIMG_VERSION"
     print "Architectures: ${architectures[*]}"
     print "Minimum macOS: $deployment_target"
 } > "$staging_root/metadata/COMPONENTS.txt"
